@@ -4,7 +4,7 @@ import threading
 import os
 import requests
 
-API = "https://api.backend.octopus.energy/v1/graphql/"
+API_PUBLIC = "https://api.backend.octopus.energy/v1/graphql/"
 
 INTROSPECTION_QUERY = """
 {
@@ -18,7 +18,7 @@ INTROSPECTION_QUERY = """
 }
 """
 
-r = requests.post(API, json={"query": INTROSPECTION_QUERY})
+r = requests.post(API_PUBLIC, json={"query": INTROSPECTION_QUERY})
 print(r.json())
 
 print("EMAIL1:", os.environ.get("OCTO_EMAIL_1"))
