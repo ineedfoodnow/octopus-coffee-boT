@@ -3,6 +3,9 @@ import time
 import threading
 import os
 
+print("EMAIL1:", os.environ.get("OCTO_EMAIL_1"))
+print("ACC1:", os.environ.get("OCTO_ACC_1"))
+
 API = "https://api.backend.octopus.energy/v1/graphql/"
 
 ACCOUNTS = [
