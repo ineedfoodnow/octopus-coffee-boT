@@ -2,73 +2,20 @@ import requests
 import time
 import threading
 import os
-import json
 
-email = "pinogaglianone@gmail.com"
-password = "pettirosso50"
-
-urls = [
-    "https://api.octopus.energy/v1/accounts/login/",
-    "https://api.octopus.energy/v1/accounts/token/",
-    "https://api.octopus.energy/v1/login/",
-    "https://octopus.energy/api/login/",
-    "https://login.octopus.energy/oauth/token",
-    "https://api.octopus.energy/oauth/token",
-    "https://api.krakenflex.systems/v1/tokens/",
-    "https://api.octopus.energy/v1/tokens/",
-]
-
-for url in urls:
-    print("\n=== TESTING:", url)
-    try:
-        r = requests.post(url, json={"email": email, "password": password})
-        print("STATUS:", r.status_code)
-        print("TEXT:", r.text[:400])
-    except Exception as e:
-        print("ERROR:", e)
-
-API_PUBLIC = "https://api.backend.octopus.energy/v1/graphql/"
-
-INTROSPECTION_QUERY = """
-{
-  __schema {
-    mutationType {
-      fields {
-        name
-      }
-    }
-  }
-}
-"""
-
-r = requests.post(API_PUBLIC, json={"query": INTROSPECTION_QUERY})
-print(r.json())
-
-print("EMAIL1:", os.environ.get("OCTO_EMAIL_1"))
-print("ACC1:", os.environ.get("OCTO_ACC_1"))
-
-API = "https://api.backend.octopus.energy/v1/graphql/"
+API_BACKEND = "https://api.backend.octopus.energy/v1/graphql/"
 
 ACCOUNTS = [
     {
-        "email": os.environ.get("OCTO_EMAIL_1"),
-        "password": os.environ.get("OCTO_PASS_1"),
+        "api_key": os.environ.get("OCTO_APIKEY_1"),
         "account": os.environ.get("OCTO_ACC_1")
     },
     {
-        "email": os.environ.get("OCTO_EMAIL_2"),
-        "password": os.environ.get("OCTO_PASS_2"),
+        "api_key": os.environ.get("OCTO_APIKEY_2"),
         "account": os.environ.get("OCTO_ACC_2")
     }
 ]
 
-LOGIN_MUTATION = """
-mutation Token($email:String!,$password:String!){
-  obtainKrakenToken(input:{email:$email,password:$password}){
-    token
-  }
-}
-"""
 
 CHECK_QUERY = """
 query Offers($account:String!){
@@ -96,141 +43,81 @@ mutation Claim($account:String!,$slug:String!){
 """
 
 
-def login(session, email, password):
-
-    print("Logging in:", email)
-
-    try:
-
-        r = session.post(
-            "https://api.octopus.energy/v1/accounts/login/",
-            json={"email": email, "password": password}
-        )
-      
-        data = r.json()
-        print("LOGIN RESPONSE:", data) # <-- debug
-        if "token" not in data:
-            print("Login error:", data)
-            return False
-
-        token = data["token"]
-
-        session.headers.update({
-            "Authorization": f"Bearer {token}"
-        })
-
-        print("Login success:", email)
-        return True
-
-    except Exception as e:
-      
-        print("Login exception:", e)
-        return False
+def make_session(api_key):
+    s = requests.Session()
+    s.auth = (api_key, "")  # Octopus API key auth
+    return s
 
 
 def check_reward(session, account):
-
     try:
         r = session.post(
-            API,
-            json={
-                "query": CHECK_QUERY,
-                "variables": {
-                    "account": account
-                }
-            }
+            API_BACKEND,
+            json={"query": CHECK_QUERY, "variables": {"account": account}},
+            timeout=10
         )
-
         data = r.json()
+        groups = data["data"]["octoplusOfferGroups"]["edges"]
 
-        for group in data["data"]["octoplusOfferGroups"]["edges"]:
+        for group in groups:
             for offer in group["node"]["octoplusOffers"]:
-
                 if offer["claimAbility"]["canClaimOffer"]:
                     return offer["slug"]
-
         return None
-
     except Exception as e:
         print("Check error:", e)
         return None
 
 
 def claim_reward(session, account, slug):
-
     print("Attempting claim:", slug)
-
     try:
         r = session.post(
-            API,
-            json={
-                "query": CLAIM_MUTATION,
-                "variables": {
-                    "account": account,
-                    "slug": slug
-                }
-            }
+            API_BACKEND,
+            json={"query": CLAIM_MUTATION, "variables": {"account": account, "slug": slug}},
+            timeout=10
         )
-
         print("Claim response:", r.json())
-
     except Exception as e:
         print("Claim error:", e)
 
 
 def worker(acc):
-
-    email = acc["email"]
-    password = acc["password"]
+    api_key = acc["api_key"]
     account = acc["account"]
 
-    if not email or not password or not account:
-        print("Missing credentials for account")
+    if not api_key or not account:
+        print("Missing credentials")
         return
 
-    print("Starting worker for:", email)
+    print("Starting worker for account:", account)
 
-    session = requests.Session()
+    session = make_session(api_key)
 
-    success = login(session, email, password)
-
-    if not success:
-        print("Login failed:", email)
-        return
-
-    end_time = time.time() + 600
+    end_time = time.time() + 600  # 10 minutes
 
     while time.time() < end_time:
-
-        print("Checking rewards:", email)
-
+        print("Checking rewards:", account)
         slug = check_reward(session, account)
 
         if slug:
             print("Reward available:", slug)
-
             claim_reward(session, account, slug)
-
-            print("Claim completed:", email)
-
+            print("Claim completed:", account)
             return
 
         time.sleep(2)
 
-    print("Finished polling window:", email)
+    print("Finished polling window:", account)
 
 
 def main():
-
     print("Starting Octopus coffee bot")
 
     threads = []
-
     for acc in ACCOUNTS:
-
         t = threading.Thread(target=worker, args=(acc,))
         t.start()
-
         threads.append(t)
 
     for t in threads:
