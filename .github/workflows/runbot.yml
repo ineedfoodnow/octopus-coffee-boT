@@ -18,7 +18,7 @@ jobs:
 
       - run: pip install requests
 
-      - run: python bot.py
+      - run: python test.py
         env:
           OCTO_EMAIL_1: ${{ secrets.OCTO_EMAIL_1 }}
           OCTO_PASS_1: ${{ secrets.OCTO_PASS_1 }}
