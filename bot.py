@@ -4,8 +4,8 @@ import threading
 import os
 import json
 
-email = pinogaglianone@gmail.com
-password = pettirosso50
+email = "pinogaglianone@gmail.com"
+password = "pettirosso50"
 
 urls = [
     "https://api.octopus.energy/v1/accounts/login/",
