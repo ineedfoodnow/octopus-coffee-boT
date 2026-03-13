@@ -2,6 +2,24 @@ import requests
 import time
 import threading
 import os
+import requests
+
+API = "https://api.backend.octopus.energy/v1/graphql/"
+
+INTROSPECTION_QUERY = """
+{
+  __schema {
+    mutationType {
+      fields {
+        name
+      }
+    }
+  }
+}
+"""
+
+r = requests.post(API, json={"query": INTROSPECTION_QUERY})
+print(r.json())
 
 print("EMAIL1:", os.environ.get("OCTO_EMAIL_1"))
 print("ACC1:", os.environ.get("OCTO_ACC_1"))
