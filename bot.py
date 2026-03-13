@@ -7,18 +7,18 @@ API = "https://api.backend.octopus.energy/v1/graphql/"
 
 ACCOUNTS = [
     {
-        "email": os.environ["OCTO_EMAIL_1"],
-        "password": os.environ["OCTO_PASS_1"],
-        "account": os.environ["OCTO_ACC_1"]
+        "email": os.environ.get("OCTO_EMAIL_1"),
+        "password": os.environ.get("OCTO_PASS_1"),
+        "account": os.environ.get("OCTO_ACC_1")
     },
     {
-        "email": os.environ["OCTO_EMAIL_2"],
-        "password": os.environ["OCTO_PASS_2"],
-        "account": os.environ["OCTO_ACC_2"]
+        "email": os.environ.get("OCTO_EMAIL_2"),
+        "password": os.environ.get("OCTO_PASS_2"),
+        "account": os.environ.get("OCTO_ACC_2")
     }
 ]
 
-LOGIN = """
+LOGIN_MUTATION = """
 mutation Token($email:String!,$password:String!){
   obtainKrakenToken(input:{email:$email,password:$password}){
     token
@@ -26,7 +26,7 @@ mutation Token($email:String!,$password:String!){
 }
 """
 
-CHECK = """
+CHECK_QUERY = """
 query Offers($account:String!){
   octoplusOfferGroups(accountNumber:$account){
     edges{
@@ -43,7 +43,7 @@ query Offers($account:String!){
 }
 """
 
-CLAIM = """
+CLAIM_MUTATION = """
 mutation Claim($account:String!,$slug:String!){
   claimOctoplusReward(accountNumber:$account,offerSlug:$slug){
     success
@@ -52,73 +52,153 @@ mutation Claim($account:String!,$slug:String!){
 """
 
 
-def login(session,email,password):
+def login(session, email, password):
 
-    r=session.post(API,json={
-        "query":LOGIN,
-        "variables":{"email":email,"password":password}
-    })
+    print("Logging in:", email)
 
-    token=r.json()["data"]["obtainKrakenToken"]["token"]
+    try:
+        r = session.post(
+            API,
+            json={
+                "query": LOGIN_MUTATION,
+                "variables": {
+                    "email": email,
+                    "password": password
+                }
+            }
+        )
 
-    session.headers.update({"Authorization":f"JWT {token}"})
+        data = r.json()
+
+        if "errors" in data:
+            print("Login error:", data)
+            return False
+
+        token = data["data"]["obtainKrakenToken"]["token"]
+
+        session.headers.update({
+            "Authorization": f"JWT {token}"
+        })
+
+        print("Login success:", email)
+
+        return True
+
+    except Exception as e:
+        print("Login exception:", e)
+        return False
 
 
-def check(session,account):
+def check_reward(session, account):
 
-    r=session.post(API,json={
-        "query":CHECK,
-        "variables":{"account":account}
-    })
+    try:
+        r = session.post(
+            API,
+            json={
+                "query": CHECK_QUERY,
+                "variables": {
+                    "account": account
+                }
+            }
+        )
 
-    data=r.json()
+        data = r.json()
 
-    for g in data["data"]["octoplusOfferGroups"]["edges"]:
-        for offer in g["node"]["octoplusOffers"]:
-            if offer["claimAbility"]["canClaimOffer"]:
-                return offer["slug"]
+        for group in data["data"]["octoplusOfferGroups"]["edges"]:
+            for offer in group["node"]["octoplusOffers"]:
 
-    return None
+                if offer["claimAbility"]["canClaimOffer"]:
+                    return offer["slug"]
+
+        return None
+
+    except Exception as e:
+        print("Check error:", e)
+        return None
 
 
-def claim(session,account,slug):
+def claim_reward(session, account, slug):
 
-    session.post(API,json={
-        "query":CLAIM,
-        "variables":{
-            "account":account,
-            "slug":slug
-        }
-    })
+    print("Attempting claim:", slug)
+
+    try:
+        r = session.post(
+            API,
+            json={
+                "query": CLAIM_MUTATION,
+                "variables": {
+                    "account": account,
+                    "slug": slug
+                }
+            }
+        )
+
+        print("Claim response:", r.json())
+
+    except Exception as e:
+        print("Claim error:", e)
 
 
 def worker(acc):
 
-    session=requests.Session()
+    email = acc["email"]
+    password = acc["password"]
+    account = acc["account"]
 
-    login(session,acc["email"],acc["password"])
+    if not email or not password or not account:
+        print("Missing credentials for account")
+        return
 
-    end=time.time()+600
+    print("Starting worker for:", email)
 
-    while time.time()<end:
+    session = requests.Session()
 
-        slug=check(session,acc["account"])
+    success = login(session, email, password)
+
+    if not success:
+        print("Login failed:", email)
+        return
+
+    end_time = time.time() + 600
+
+    while time.time() < end_time:
+
+        print("Checking rewards:", email)
+
+        slug = check_reward(session, account)
 
         if slug:
-            claim(session,acc["account"],slug)
-            print("Claimed",acc["email"])
+            print("Reward available:", slug)
+
+            claim_reward(session, account, slug)
+
+            print("Claim completed:", email)
+
             return
 
         time.sleep(2)
 
+    print("Finished polling window:", email)
 
-threads=[]
 
-for acc in ACCOUNTS:
+def main():
 
-    t=threading.Thread(target=worker,args=(acc,))
-    t.start()
-    threads.append(t)
+    print("Starting Octopus coffee bot")
 
-for t in threads:
-    t.join()
+    threads = []
+
+    for acc in ACCOUNTS:
+
+        t = threading.Thread(target=worker, args=(acc,))
+        t.start()
+
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    print("Bot finished")
+
+
+if __name__ == "__main__":
+    main()
