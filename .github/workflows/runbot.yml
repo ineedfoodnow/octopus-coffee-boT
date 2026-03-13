@@ -18,11 +18,9 @@ jobs:
 
       - run: pip install requests
 
-      - run: python test.py
+      - run: python bot.py
         env:
-          OCTO_EMAIL_1: ${{ secrets.OCTO_EMAIL_1 }}
-          OCTO_PASS_1: ${{ secrets.OCTO_PASS_1 }}
+          OCTO_APIKEY_1: ${{ secrets.OCTO_APIKEY_1 }}
           OCTO_ACC_1: ${{ secrets.OCTO_ACC_1 }}
-          OCTO_EMAIL_2: ${{ secrets.OCTO_EMAIL_2 }}
-          OCTO_PASS_2: ${{ secrets.OCTO_PASS_2 }}
+          OCTO_APIKEY_2: ${{ secrets.OCTO_APIKEY_2 }}
           OCTO_ACC_2: ${{ secrets.OCTO_ACC_2 }}
