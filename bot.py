@@ -80,29 +80,17 @@ def login(session, email, password):
     try:
 
         r = session.post(
-            API,
-            json={
-                "query": """
-                mutation Token($email:String!,$password:String!) {
-                  obtainKrakenToken(email:$email,password:$password) {
-                    token
-                  }
-                }
-                """,
-                "variables": {
-                        "email": email,
-                        "password": password
-                }
-            }
+            "https://api.octopus.energy/v1/accounts/login/",
+            json={"email": email, "password": password}
         )
-
+      
         data = r.json()
         print("LOGIN RESPONSE:", data) # <-- debug
-        if "errors" in data:
+        if "token" not in data:
             print("Login error:", data)
             return False
 
-        token = data["data"]["obtainKrakenToken"]["token"]
+        token = data["token"]
 
         session.headers.update({
             "Authorization": f"Bearer {token}"
@@ -112,7 +100,7 @@ def login(session, email, password):
         return True
 
     except Exception as e:
-
+      
         print("Login exception:", e)
         return False
 
