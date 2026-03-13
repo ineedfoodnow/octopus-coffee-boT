@@ -60,13 +60,22 @@ def login(session, email, password):
     print("Logging in:", email)
 
     try:
+
         r = session.post(
-            API,
+            "https://api.octopus.energy/v1/graphql/",
             json={
-                "query": LOGIN_MUTATION,
+                "query": """
+                mutation($input: ObtainJSONWebTokenInput!) {
+                  obtainJSONWebToken(input: $input) {
+                    token
+                  }
+                }
+                """,
                 "variables": {
-                    "email": email,
-                    "password": password
+                    "input": {
+                        "email": email,
+                        "password": password
+                    }
                 }
             }
         )
@@ -77,7 +86,7 @@ def login(session, email, password):
             print("Login error:", data)
             return False
 
-        token = data["data"]["obtainKrakenToken"]["token"]
+        token = data["data"]["obtainJSONWebToken"]["token"]
 
         session.headers.update({
             "Authorization": f"JWT {token}"
@@ -88,6 +97,7 @@ def login(session, email, password):
         return True
 
     except Exception as e:
+
         print("Login exception:", e)
         return False
 
