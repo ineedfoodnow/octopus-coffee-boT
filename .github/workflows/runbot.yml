@@ -2,6 +2,11 @@ name: Octopus Coffee Bot
 
 on:
   schedule:
+    - cron: "55 4 * * *"
+    - cron: "57 4 * * *"
+    - cron: "59 4 * * *"
+    - cron: "1 5 * * *"
+    - cron: "3 5 * * *"
     # 05:00 UK during BST
     - cron: "0 4 * * *"
     # 05:00 UK during GMT
