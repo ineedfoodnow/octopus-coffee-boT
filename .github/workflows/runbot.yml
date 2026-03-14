@@ -2,14 +2,15 @@ name: Octopus Coffee Bot
 
 on:
   schedule:
-    # run every day just before 5am UK coffee drop
-    - cron: "59 4 * * *"
+    # 05:00 UK during BST
+    - cron: "0 4 * * *"
+    # 05:00 UK during GMT
+    - cron: "0 5 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     timeout-minutes: 10
 
     steps:
