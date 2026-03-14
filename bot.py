@@ -16,7 +16,6 @@ ACCOUNTS = [
     }
 ]
 
-
 CHECK_QUERY = """
 query Offers($account:String!){
   octoplusOfferGroups(accountNumber:$account){
@@ -44,11 +43,8 @@ mutation Claim($account:String!,$slug:String!){
 
 
 def make_session(api_key):
-
     s = requests.Session()
-
     s.auth = (api_key, "")
-
     return s
 
 
@@ -62,7 +58,7 @@ def get_poll_interval():
         t.tm_sec
     )
 
-    target = 5 * 3600  # 05:00:00
+    target = 5 * 3600
 
     delta = seconds_since_midnight - target
 
@@ -171,7 +167,6 @@ def claim_reward(session, account, slug):
 def worker(acc):
 
     api_key = acc["api_key"]
-
     account = acc["account"]
 
     if not api_key or not account:
