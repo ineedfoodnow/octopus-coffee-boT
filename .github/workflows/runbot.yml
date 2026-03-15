@@ -2,14 +2,14 @@ name: Octopus Coffee Bot
 
 on:
   schedule:
-  - cron: "0 3 * * *"
-  - cron: "15 3 * * *"
-  - cron: "30 3 * * *"
-  - cron: "45 3 * * *"
-  - cron: "0 4 * * *"
-  - cron: "15 4 * * *"
-  - cron: "30 4 * * *"
-  - cron: "45 4 * * *"
+    - cron: "0 3 * * *"
+    - cron: "15 3 * * *"
+    - cron: "30 3 * * *"
+    - cron: "45 3 * * *"
+    - cron: "0 4 * * *"
+    - cron: "15 4 * * *"
+    - cron: "30 4 * * *"
+    - cron: "45 4 * * *"
   workflow_dispatch:
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
         run: pip install requests
 
       - name: Run coffee bot
-        run: python 
+        run: python bot.py
         env:
           OCTO_APIKEY_1: ${{ secrets.OCTO_APIKEY_1 }}
           OCTO_ACC_1: ${{ secrets.OCTO_ACC_1 }}
