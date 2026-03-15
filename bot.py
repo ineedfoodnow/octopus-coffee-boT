@@ -13,6 +13,10 @@ ACCOUNTS = [
     {
         "api_key": os.environ.get("OCTO_APIKEY_2"),
         "account": os.environ.get("OCTO_ACC_2")
+    },
+    {
+        "api_key": os.environ.get("OCTO_APIKEY_3"),
+        "account": os.environ.get("OCTO_ACC_3")
     }
 ]
 
