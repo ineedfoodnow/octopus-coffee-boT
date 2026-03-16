@@ -1,0 +1,53 @@
+name: Octopus Coffee Bot
+
+# Primary trigger: cron-job.org calls this endpoint at exactly 4:55am
+# Europe/London every Mon–Thu, handling BST/GMT automatically.
+# URL: https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/actions/workflows/coffee-bot.yml/dispatches
+#
+# Fallback crons fire if cron-job.org misses a run. Two entries needed
+# because GitHub cron is UTC-only — the bot's time guard aborts the
+# wrong-season one in seconds, costing < 1 runner minute.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Bypass time guard (for manual catch-up runs)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+  schedule:
+    - cron: "55 4 * * 1-4"  # GMT season (Oct–Mar): 4:55am UTC = 4:55am UK
+    - cron: "55 3 * * 1-4"  # BST season (Mar–Oct): 3:55am UTC = 4:55am UK
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run coffee bot
+        run: python bot.py
+        env:
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          OCTO_APIKEY_1: ${{ secrets.OCTO_APIKEY_1 }}
+          OCTO_ACC_1: ${{ secrets.OCTO_ACC_1 }}
+          OCTO_APIKEY_2: ${{ secrets.OCTO_APIKEY_2 }}
+          OCTO_ACC_2: ${{ secrets.OCTO_ACC_2 }}
+          OCTO_APIKEY_3: ${{ secrets.OCTO_APIKEY_3 }}
+          OCTO_ACC_3: ${{ secrets.OCTO_ACC_3 }}
