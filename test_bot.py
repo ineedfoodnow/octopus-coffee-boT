@@ -17,18 +17,18 @@ FORCE_RUN    = os.environ.get("FORCE_RUN", "true").lower() == "true"
 ACCOUNTS = [
     {
         "label":   "Account 1",
-        "api_key": os.environ.get("OCTO_APIKEY_1"),
-        "account": os.environ.get("OCTO_ACC_1"),
+        "api_key": os.environ.get("OCTO_APIKEY_1", "").strip(),
+        "account": os.environ.get("OCTO_ACC_1", "").strip(),
     },
     {
         "label":   "Account 2",
-        "api_key": os.environ.get("OCTO_APIKEY_2"),
-        "account": os.environ.get("OCTO_ACC_2"),
+        "api_key": os.environ.get("OCTO_APIKEY_2", "").strip(),
+        "account": os.environ.get("OCTO_ACC_2", "").strip(),
     },
     {
         "label":   "Account 3",
-        "api_key": os.environ.get("OCTO_APIKEY_3"),
-        "account": os.environ.get("OCTO_ACC_3"),
+        "api_key": os.environ.get("OCTO_APIKEY_3", "").strip(),
+        "account": os.environ.get("OCTO_ACC_3", "").strip(),
     },
 ]
 
