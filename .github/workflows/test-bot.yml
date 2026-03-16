@@ -1,0 +1,32 @@
+name: Octopus Coffee Bot — Test Run
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run test bot
+        run: python test_bot.py
+        env:
+          FORCE_RUN: "true"
+          OCTO_APIKEY_1: ${{ secrets.OCTO_APIKEY_1 }}
+          OCTO_ACC_1: ${{ secrets.OCTO_ACC_1 }}
+          OCTO_APIKEY_2: ${{ secrets.OCTO_APIKEY_2 }}
+          OCTO_ACC_2: ${{ secrets.OCTO_ACC_2 }}
+          OCTO_APIKEY_3: ${{ secrets.OCTO_APIKEY_3 }}
+          OCTO_ACC_3: ${{ secrets.OCTO_ACC_3 }}
