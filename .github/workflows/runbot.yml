@@ -1,21 +1,14 @@
 name: Octopus Coffee Bot
 
 on:
-  schedule:
-    - cron: "0 3 * * *"
-    - cron: "15 3 * * *"
-    - cron: "30 3 * * *"
-    - cron: "45 3 * * *"
-    - cron: "0 4 * * *"
-    - cron: "15 4 * * *"
-    - cron: "30 4 * * *"
-    - cron: "45 4 * * *"
   workflow_dispatch:
+  schedule:
+    - cron: "55 4 * * *"  # Emergency fallback (GMT season only). Primary trigger is cron-job.org
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
