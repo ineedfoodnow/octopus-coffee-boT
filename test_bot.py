@@ -34,10 +34,10 @@ ACCOUNTS = [
 
 CHECK_QUERY = """
 query Offers($account:String!){
-  octoplusOfferGroups(accountNumber:$account){
+  octoplusOfferGroups(accountNumber:$account, first:10){
     edges{
       node{
-        octoplusOffers(first:10){
+        octoplusOffers{
           slug
           claimAbility{
             canClaimOffer
