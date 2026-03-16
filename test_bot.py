@@ -164,7 +164,7 @@ def check_api_connectivity():
 # ─────────────────────────────────────────────
 #  TOKEN EXCHANGE
 # ─────────────────────────────────────────────
-def get_auth_token(api_key):
+def get_auth_token(api_key, label=""):
     try:
         r = requests.post(
             API_BACKEND,
@@ -181,10 +181,10 @@ def get_auth_token(api_key):
                 .get("token")
         )
         if not token:
-            print(f"        ⛔ Token exchange failed: {data.get('errors', data)}")
+            print(f"  │        ⛔ Token exchange failed: {data.get('errors', data)}")
         return token
     except Exception as e:
-        print(f"        ⛔ Token exchange error: {e}")
+        print(f"  │        ⛔ Token exchange error: {e}")
         return None
 
 # ─────────────────────────────────────────────
@@ -206,8 +206,8 @@ def check_offers():
             results[label] = {"skip": True}
             continue
 
-        log("🔑", "Exchanging API key for token...", "", indent=3)
-        token = get_auth_token(api_key)
+        log("🔑", "Exchanging API key for token", "", indent=3)
+        token = get_auth_token(api_key, label)
         if not token:
             result("❌", "Token exchange failed — check api_key is correct", indent=3)
             results[label] = {"auth_failed": True}
@@ -229,8 +229,18 @@ def check_offers():
             errors = data.get("errors")
 
             if errors:
-                result(f"❌", f"API error — {errors[0].get('message', errors)}", indent=3)
-                results[label] = {"api_error": True}
+                msg  = errors[0].get("message", str(errors))
+                code = errors[0].get("extensions", {}).get("errorCode", "")
+
+                if code == "KT-GB-9319":
+                    result("⏸ ", "No offers available right now — expected outside 5am window", indent=3)
+                    results[label] = {"unavailable": True}
+                elif code == "KT-GB-9316":
+                    result("❌", "Account is not enrolled in Octoplus", indent=3)
+                    results[label] = {"not_enrolled": True}
+                else:
+                    result(f"❌", f"API error — {msg} ({code})", indent=3)
+                    results[label] = {"api_error": True}
                 continue
 
             groups = data.get("data", {}).get("octoplusOfferGroups", {})
@@ -317,8 +327,9 @@ def attempt_claims(offer_results):
                 result("✅", "Claimed successfully! 🎉", indent=3)
                 claim_results[label] = "claimed"
             elif errors:
-                msg = errors[0].get("message", str(errors))
-                result(f"❌", f"Claim rejected — {msg}", indent=3)
+                msg  = errors[0].get("message", str(errors))
+                code = errors[0].get("extensions", {}).get("errorCode", "")
+                result(f"❌", f"Claim rejected — {msg} ({code})", indent=3)
                 claim_results[label] = f"rejected: {msg}"
             else:
                 result("⚠️ ", f"Unexpected response — {resp}", indent=3)
@@ -353,10 +364,14 @@ def print_summary(offer_results, claim_results):
         info  = offer_results.get(label, {})
         claim = (claim_results or {}).get(label)
 
-        if info.get("skip") or info.get("auth_failed") or info.get("api_error") or info.get("exception"):
-            status = "❌  Error — check Phase 3/4 output above"
-        elif info.get("no_offers"):
-            status = "⚠️   Not on Octoplus"
+        if info.get("not_enrolled"):
+            status = "❌  Account not enrolled in Octoplus"
+        elif info.get("skip") or info.get("auth_failed"):
+            status = "❌  Auth error — check API key"
+        elif info.get("api_error") or info.get("exception"):
+            status = "❌  Unexpected error — check Phase 4 output"
+        elif info.get("no_offers") or info.get("unavailable"):
+            status = "⏸   Offers not available right now — run near 5am UK to claim"
         elif info.get("slug"):
             status = "✅  Claimed" if claim == "claimed" else f"⚠️   Offer found but claim failed ({claim})"
         else:
