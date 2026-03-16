@@ -37,7 +37,7 @@ query Offers($account:String!){
   octoplusOfferGroups(accountNumber:$account){
     edges{
       node{
-        octoplusOffers{
+        octoplusOffers(first:10){
           slug
           claimAbility{
             canClaimOffer
