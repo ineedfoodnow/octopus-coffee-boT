@@ -74,6 +74,46 @@ mutation Claim($account:String!,$slug:String!){
 """
 
 # ─────────────────────────────────────────────
+#  LOGGING HELPERS
+# ─────────────────────────────────────────────
+_print_lock = threading.Lock()
+
+def safe_print(*args, **kwargs):
+    with _print_lock:
+        print(*args, **kwargs)
+
+def divider(char="─", width=56):
+    safe_print(char * width)
+
+def header(title):
+    divider("═")
+    pad = (56 - len(title) - 2) // 2
+    safe_print(f"{'═' * pad} {title} {'═' * (56 - pad - len(title) - 2)}")
+    divider("═")
+
+def section(title):
+    safe_print()
+    safe_print(f"  ┌─ {title}")
+
+def log(icon, label, msg, indent=2):
+    prefix = "  │  " + "  " * indent
+    safe_print(f"{prefix}{icon} {label}: {msg}")
+
+def result(icon, msg, indent=2):
+    prefix = "  │  " + "  " * indent
+    safe_print(f"{prefix}{icon} {msg}")
+
+def close_section():
+    safe_print("  └" + "─" * 54)
+
+def account_header(label, masked_account):
+    safe_print(f"  │")
+    safe_print(f"  │  ▸ {label}  ({masked_account})")
+
+def mask(val):
+    return (val[:4] + "••••••") if val else "── NOT SET ──"
+
+# ─────────────────────────────────────────────
 #  TOKEN EXCHANGE
 # ─────────────────────────────────────────────
 def get_auth_token(api_key, label):
@@ -93,52 +133,70 @@ def get_auth_token(api_key, label):
                 .get("token")
         )
         if not token:
-            print(f"[{label}] Token exchange failed: {data.get('errors', data)}")
+            log("⛔", "Token exchange failed",
+                str(data.get("errors", data)), indent=3)
         return token
     except Exception as e:
-        print(f"[{label}] Token exchange error: {e}")
+        log("⛔", "Token exchange error", str(e), indent=3)
         return None
 
 # ─────────────────────────────────────────────
 #  TIME GUARD
 # ─────────────────────────────────────────────
 def wait_for_5am():
+    section("Schedule Check")
     now      = datetime.now(UK_TZ)
     weekday  = now.weekday()
     day_name = now.strftime("%A")
 
+    log("🌍", "Current UK time", now.strftime("%A %d %b %Y  %H:%M:%S %Z"))
+
     if FORCE_RUN:
-        print(f"⚡ FORCE_RUN — bypassing time/day guard.")
-        print(f"   Current UK time: {now.strftime('%A %d %b %Y %H:%M:%S %Z')}")
+        log("⚡", "FORCE_RUN", "time/day guard bypassed")
+        close_section()
         return True, 2 * 60
 
     if weekday not in POLL_WINDOWS:
-        print(f"Today is {day_name} — bot only runs Mon–Thu. Exiting.")
+        log("📅", "Run day check", f"✗ {day_name} — bot only runs Mon–Thu")
+        close_section()
         return False, 0
 
     poll_window = POLL_WINDOWS[weekday]
     today_5am   = now.replace(hour=5, minute=0, second=0, microsecond=0)
     secs        = (today_5am - now).total_seconds()
 
+    log("📅", "Run day check", f"✅ {day_name} — valid")
+    log("⏱ ", "Poll window",   f"{poll_window // 60} minutes")
+
     if secs > MAX_PRE_SLEEP:
-        print(f"Started {secs:.0f}s before 5am UK — wrong-season cron fired, aborting.")
+        log("⏳", "Time check",
+            f"✗ {secs:.0f}s before 5am — wrong-season cron fired, aborting")
+        close_section()
         return False, 0
 
     if secs < -poll_window:
-        print(f"Poll window expired ({abs(secs):.0f}s past 5am UK) — stale trigger, aborting.")
+        log("⏰", "Time check",
+            f"✗ {abs(secs):.0f}s past 5am — stale trigger, aborting")
+        close_section()
         return False, 0
 
     if secs > 0:
-        print(f"[{day_name}] Sleeping {secs:.1f}s until exactly 5am UK...")
+        log("⏳", "Sleeping",
+            f"{secs:.1f}s until exactly 5am UK...")
+        close_section()
         time.sleep(secs)
     else:
-        print(f"[{day_name}] {abs(secs):.0f}s past 5am UK — polling immediately.")
+        log("⏰", "Time check",
+            f"✅ {abs(secs):.0f}s past 5am — polling immediately")
+        close_section()
 
-    print(f"[{day_name}] Poll window: {poll_window // 60} minutes.")
     return True, poll_window
 
+
 def get_poll_end_time(poll_window):
-    today_5am = datetime.now(UK_TZ).replace(hour=5, minute=0, second=0, microsecond=0)
+    today_5am = datetime.now(UK_TZ).replace(
+        hour=5, minute=0, second=0, microsecond=0
+    )
     return today_5am.timestamp() + poll_window
 
 # ─────────────────────────────────────────────
@@ -160,12 +218,12 @@ def check_reward(token, account, label):
             msg  = errors[0].get("message", str(errors))
 
             if code == "KT-GB-9319":
-                return None       # Offers not available yet — keep polling
+                return None         # Offers not available yet — keep polling
             elif code == "KT-GB-9316":
-                print(f"[{label}] Account not enrolled in Octoplus — stopping.")
+                log("❌", "Octoplus", "Account not enrolled — stopping", indent=3)
                 return "NOT_ENROLLED"
             else:
-                print(f"[{label}] API error: {msg} ({code})")
+                log("⚠️ ", "API error", f"{msg} ({code})", indent=3)
                 return None
 
         groups = data.get("data", {}).get("octoplusOfferGroups", {})
@@ -180,14 +238,14 @@ def check_reward(token, account, label):
         return None
 
     except Exception as e:
-        print(f"[{label}] Check error: {e}")
+        log("⚠️ ", "Check error", str(e), indent=3)
         return None
 
 # ─────────────────────────────────────────────
 #  CLAIM
 # ─────────────────────────────────────────────
 def claim_reward(token, account, slug, label):
-    print(f"[{label}] Attempting claim: {slug}")
+    log("🎯", "Claiming", slug, indent=3)
     try:
         r = requests.post(
             API_BACKEND,
@@ -208,77 +266,99 @@ def claim_reward(token, account, slug, label):
             errors = resp.get("errors")
             msg    = errors[0].get("message", str(resp)) if errors else str(resp)
             code   = errors[0].get("extensions", {}).get("errorCode", "") if errors else ""
-            print(f"[{label}] Claim failed: {msg} ({code})")
+            log("❌", "Claim failed", f"{msg} ({code})", indent=3)
         return success
     except Exception as e:
-        print(f"[{label}] Claim error: {e}")
+        log("❌", "Claim error", str(e), indent=3)
         return False
 
 # ─────────────────────────────────────────────
 #  WORKER
 # ─────────────────────────────────────────────
-def worker(acc, end_time, on_done):
+def worker(acc, end_time, on_done, summary):
     api_key = acc["api_key"]
     account = acc["account"]
     label   = acc["label"]
 
+    account_header(label, mask(account))
+
     if not api_key or not account:
-        print(f"[{label}] Missing credentials — check secrets.")
+        log("❌", "Credentials", "Missing — check secrets", indent=3)
+        summary[label] = "❌  Missing credentials"
         on_done()
         return
 
+    log("🔑", "Token", "Exchanging API key...", indent=3)
     token = get_auth_token(api_key, label)
     if not token:
-        print(f"[{label}] Could not obtain token — skipping.")
+        log("❌", "Token", "Exchange failed — skipping", indent=3)
+        summary[label] = "❌  Token exchange failed"
         on_done()
         return
 
-    print(f"[{label}] Token obtained. Polling...")
+    log("✅", "Token", "Obtained — polling...", indent=3)
 
     try:
         while time.time() < end_time:
             slug = check_reward(token, account, label)
 
             if slug == "NOT_ENROLLED":
+                summary[label] = "❌  Account not enrolled in Octoplus"
                 return
 
             if slug:
-                print(f"[{label}] Reward available: {slug}")
+                log("🎟 ", "Offer found", slug, indent=3)
                 for attempt in range(3):
                     if claim_reward(token, account, slug, label):
-                        print(f"[{label}] ✓ Claimed successfully.")
+                        log("✅", "Claimed", "Successfully! 🎉", indent=3)
+                        summary[label] = "✅  Claimed successfully"
                         return
-                    print(f"[{label}] Attempt {attempt + 1} failed, retrying in 2s...")
+                    log("⚠️ ", f"Attempt {attempt + 1}", "Failed — retrying in 2s", indent=3)
                     time.sleep(2)
-                print(f"[{label}] All 3 claim attempts failed.")
+                log("❌", "Claim", "All 3 attempts failed", indent=3)
+                summary[label] = "❌  All claim attempts failed"
                 return
 
             time.sleep(0.25 if (end_time - time.time()) < 60 else 1)
 
         now = datetime.now(UK_TZ)
         if now.weekday() == 0:
-            print(f"[{label}] Monday window expired — fallback runs Tue–Thu will retry.")
+            log("⏰", "Window", "Monday expired — Tue–Thu fallback will retry", indent=3)
+            summary[label] = "⏸   Window expired — fallback will retry"
         else:
-            print(f"[{label}] Fallback window expired — retry next Monday.")
+            log("⏰", "Window", "Expired — retry next Monday", indent=3)
+            summary[label] = "⏸   Window expired — retry next Monday"
 
     finally:
         on_done()
 
 # ─────────────────────────────────────────────
+#  SUMMARY
+# ─────────────────────────────────────────────
+def print_summary(summary):
+    section("Summary")
+    for acc in ACCOUNTS:
+        log("", acc["label"], summary.get(acc["label"], "⏸  No result recorded"), indent=1)
+    close_section()
+
+# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 def main():
-    print(f"Octopus coffee bot started: {datetime.now(UK_TZ).strftime('%A %d %b %Y %H:%M:%S %Z')}")
+    header("OCTOPUS COFFEE BOT  ·  PRODUCTION")
+    print(f"  Started : {datetime.now(UK_TZ).strftime('%A %d %b %Y  %H:%M:%S %Z')}")
+    print(f"  Mode    : {'⚡ FORCE_RUN (manual)' if FORCE_RUN else '🕐 Scheduled run'}")
 
     should_run, poll_window = wait_for_5am()
     if not should_run:
         sys.exit(0)
 
-    print("Launching workers...")
+    section("Workers")
     end_time   = get_poll_end_time(poll_window)
     done_count = [0]
     done_lock  = threading.Lock()
     all_done   = threading.Event()
+    summary    = {}
 
     def on_done():
         with done_lock:
@@ -287,7 +367,7 @@ def main():
                 all_done.set()
 
     threads = [
-        threading.Thread(target=worker, args=(acc, end_time, on_done))
+        threading.Thread(target=worker, args=(acc, end_time, on_done, summary))
         for acc in ACCOUNTS
     ]
     for t in threads:
@@ -297,7 +377,9 @@ def main():
     for t in threads:
         t.join(timeout=5)
 
-    print(f"Bot finished: {datetime.now(UK_TZ).strftime('%H:%M:%S %Z')}")
+    close_section()
+    print_summary(summary)
+    header(f"FINISHED  ·  {datetime.now(UK_TZ).strftime('%H:%M:%S %Z')}")
 
 
 if __name__ == "__main__":
