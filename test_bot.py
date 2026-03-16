@@ -9,10 +9,10 @@ from datetime import datetime
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
-API_BACKEND  = "https://api.backend.octopus.energy/v1/graphql/"
-UK_TZ        = ZoneInfo("Europe/London")
-POLL_WINDOW  = 2 * 60   # 2 minutes — enough for a test without burning minutes
-FORCE_RUN    = os.environ.get("FORCE_RUN", "true").lower() == "true"
+API_BACKEND = "https://api.octopus.energy/v1/graphql/"
+UK_TZ       = ZoneInfo("Europe/London")
+POLL_WINDOW = 2 * 60
+FORCE_RUN   = os.environ.get("FORCE_RUN", "true").lower() == "true"
 
 ACCOUNTS = [
     {
@@ -31,6 +31,14 @@ ACCOUNTS = [
         "account": os.environ.get("OCTO_ACC_3", "").strip(),
     },
 ]
+
+OBTAIN_TOKEN_MUTATION = """
+mutation ObtainToken($apiKey: String!){
+  obtainKrakenToken(input: { APIKey: $apiKey }){
+    token
+  }
+}
+"""
 
 CHECK_QUERY = """
 query Offers($account:String!){
@@ -85,7 +93,6 @@ def close_section():
     print("  └" + "─" * 54)
 
 def mask(val):
-    """Show first 4 chars only — confirms the value loaded without exposing it."""
     return (val[:4] + "••••••") if val else "── NOT SET ──"
 
 # ─────────────────────────────────────────────
@@ -99,8 +106,7 @@ def check_secrets():
         acc_ok = bool(acc["account"])
         icon   = "✅" if (key_ok and acc_ok) else "❌"
         log(icon, acc["label"],
-            f"api_key={mask(acc['api_key'])}  "
-            f"account={mask(acc['account'])}")
+            f"api_key={mask(acc['api_key'])}  account={mask(acc['account'])}")
         if not (key_ok and acc_ok):
             all_ok = False
     if not all_ok:
@@ -109,25 +115,24 @@ def check_secrets():
     return all_ok
 
 # ─────────────────────────────────────────────
-#  PHASE 2 — TIMEZONE / SCHEDULE LOGIC
+#  PHASE 2 — TIMEZONE
 # ─────────────────────────────────────────────
 def check_timezone():
     section("PHASE 2 — Timezone & Schedule Logic")
-    now      = datetime.now(UK_TZ)
-    weekday  = now.weekday()
-    day_name = now.strftime("%A")
+    now       = datetime.now(UK_TZ)
+    weekday   = now.weekday()
+    day_name  = now.strftime("%A")
     today_5am = now.replace(hour=5, minute=0, second=0, microsecond=0)
-    secs_until = (today_5am - now).total_seconds()
+    secs      = (today_5am - now).total_seconds()
 
     log("🌍", "Current UK time", now.strftime("%A %d %b %Y  %H:%M:%S %Z"))
     log("📅", "Valid run day",
-        f"{'✅ Yes' if weekday in range(4) else '⚠️  No (bot skips Fri–Sun in production)'}"
-        f"  ({day_name})")
+        f"{'✅ Yes' if weekday in range(4) else '⚠️  No (bot skips Fri–Sun in production)'}  ({day_name})")
 
-    if secs_until > 0:
-        log("⏳", "Time until 5am UK", f"{secs_until:.0f}s  ({secs_until/60:.1f} min)")
+    if secs > 0:
+        log("⏳", "Time until 5am UK", f"{secs:.0f}s  ({secs/60:.1f} min)")
     else:
-        log("⏰", "Time past 5am UK",  f"{abs(secs_until):.0f}s  ({abs(secs_until)/60:.1f} min ago)")
+        log("⏰", "Time past 5am UK",  f"{abs(secs):.0f}s  ({abs(secs)/60:.1f} min ago)")
 
     if FORCE_RUN:
         result("⚡", "FORCE_RUN=true — time guard bypassed for this test")
@@ -135,20 +140,52 @@ def check_timezone():
     close_section()
 
 # ─────────────────────────────────────────────
-#  PHASE 3 — API CONNECTIVITY
+#  PHASE 3 — CONNECTIVITY
 # ─────────────────────────────────────────────
 def check_api_connectivity():
     section("PHASE 3 — API Connectivity")
     try:
-        r = requests.get("https://api.backend.octopus.energy/", timeout=8)
-        log("🌐", "Octopus API reachable", f"HTTP {r.status_code}")
+        r = requests.post(
+            API_BACKEND,
+            json={"query": "{ __typename }"},
+            timeout=8,
+        )
+        reachable = r.status_code in (200, 400)
+        icon      = "🌐" if reachable else "❌"
+        log(icon, "Octopus API reachable", f"HTTP {r.status_code}")
+        close_section()
+        return reachable
     except Exception as e:
         log("❌", "Octopus API unreachable", str(e))
         result("⛔", "Cannot proceed — network issue")
         close_section()
         return False
-    close_section()
-    return True
+
+# ─────────────────────────────────────────────
+#  TOKEN EXCHANGE
+# ─────────────────────────────────────────────
+def get_auth_token(api_key):
+    try:
+        r = requests.post(
+            API_BACKEND,
+            json={
+                "query": OBTAIN_TOKEN_MUTATION,
+                "variables": {"apiKey": api_key},
+            },
+            timeout=10,
+        )
+        data  = r.json()
+        token = (
+            data.get("data", {})
+                .get("obtainKrakenToken", {})
+                .get("token")
+        )
+        if not token:
+            print(f"        ⛔ Token exchange failed: {data.get('errors', data)}")
+        return token
+    except Exception as e:
+        print(f"        ⛔ Token exchange error: {e}")
+        return None
 
 # ─────────────────────────────────────────────
 #  PHASE 4 — AUTH & OFFER CHECK
@@ -169,20 +206,24 @@ def check_offers():
             results[label] = {"skip": True}
             continue
 
+        log("🔑", "Exchanging API key for token...", "", indent=3)
+        token = get_auth_token(api_key)
+        if not token:
+            result("❌", "Token exchange failed — check api_key is correct", indent=3)
+            results[label] = {"auth_failed": True}
+            continue
+
+        log("✅", "Token obtained", "", indent=3)
+
         try:
             r = requests.post(
                 API_BACKEND,
-                auth=(api_key, ""),
+                headers={"Authorization": token},
                 json={"query": CHECK_QUERY, "variables": {"account": account}},
                 timeout=10,
             )
 
             log("📡", "HTTP", str(r.status_code), indent=3)
-
-            if r.status_code == 401:
-                result("❌", "Auth failed — api_key rejected by Octopus", indent=3)
-                results[label] = {"auth_failed": True}
-                continue
 
             data   = r.json()
             errors = data.get("errors")
@@ -196,7 +237,7 @@ def check_offers():
             edges  = groups.get("edges", []) if groups else []
 
             if not edges:
-                result("⚠️ ", "No offer groups returned — account may not be on Octoplus", indent=3)
+                result("⚠️ ", "No offer groups — account may not be on Octoplus", indent=3)
                 results[label] = {"no_offers": True}
                 continue
 
@@ -206,11 +247,11 @@ def check_offers():
                     slug      = offer.get("slug", "unknown")
                     claimable = offer.get("claimAbility", {}).get("canClaimOffer", False)
                     icon      = "✅ CLAIMABLE NOW" if claimable else "⏸  Not claimable (already claimed or vouchers gone)"
-                    log("🎟 ", f"{slug}", icon, indent=3)
+                    log("🎟 ", slug, icon, indent=3)
                     if claimable:
                         claimable_slug = slug
 
-            results[label] = {"slug": claimable_slug}
+            results[label] = {"slug": claimable_slug, "token": token, "account": account}
 
         except Exception as e:
             result(f"❌", f"Request failed — {e}", indent=3)
@@ -220,28 +261,27 @@ def check_offers():
     return results
 
 # ─────────────────────────────────────────────
-#  PHASE 5 — CLAIM ATTEMPT
+#  PHASE 5 — CLAIM
 # ─────────────────────────────────────────────
 def attempt_claims(offer_results):
     section("PHASE 5 — Claim Attempt")
 
     claimable = {
-        label: info["slug"]
+        label: info
         for label, info in offer_results.items()
         if info.get("slug")
     }
 
     if not claimable:
         result("ℹ️ ", "No claimable offers found right now")
-        result("💡", "This is expected if today's vouchers are gone — "
-                     "the scheduled 5am run will catch them tomorrow")
+        result("💡", "Expected if today's vouchers are gone — 5am run will catch them")
         close_section()
-        return
+        return {}
 
-    results  = {}
-    lock     = threading.Lock()
-    all_done = threading.Event()
-    counter  = [0]
+    claim_results = {}
+    lock          = threading.Lock()
+    all_done      = threading.Event()
+    counter       = [0]
 
     def on_done():
         with lock:
@@ -249,18 +289,19 @@ def attempt_claims(offer_results):
             if counter[0] >= len(claimable):
                 all_done.set()
 
-    def claim_worker(label, account_info, slug):
-        api_key = account_info["api_key"]
-        account = account_info["account"]
+    def claim_worker(label, info):
+        token   = info["token"]
+        account = info["account"]
+        slug    = info["slug"]
         print(f"  │")
-        print(f"  │  ▸ {label} — attempting claim of {slug}")
+        print(f"  │  ▸ {label} — claiming {slug}")
         try:
             r = requests.post(
                 API_BACKEND,
-                auth=(api_key, ""),
+                headers={"Authorization": token},
                 json={
                     "query": CLAIM_MUTATION,
-                    "variables": {"account": account, "slug": slug}
+                    "variables": {"account": account, "slug": slug},
                 },
                 timeout=10,
             )
@@ -274,26 +315,24 @@ def attempt_claims(offer_results):
 
             if success:
                 result("✅", "Claimed successfully! 🎉", indent=3)
-                results[label] = "claimed"
+                claim_results[label] = "claimed"
             elif errors:
                 msg = errors[0].get("message", str(errors))
                 result(f"❌", f"Claim rejected — {msg}", indent=3)
-                results[label] = f"rejected: {msg}"
+                claim_results[label] = f"rejected: {msg}"
             else:
                 result("⚠️ ", f"Unexpected response — {resp}", indent=3)
-                results[label] = "unexpected"
+                claim_results[label] = "unexpected"
 
         except Exception as e:
             result(f"❌", f"Claim request failed — {e}", indent=3)
-            results[label] = f"exception: {e}"
+            claim_results[label] = f"exception: {e}"
         finally:
             on_done()
 
-    acc_map = {acc["label"]: acc for acc in ACCOUNTS}
-
     threads = [
-        threading.Thread(target=claim_worker, args=(label, acc_map[label], slug))
-        for label, slug in claimable.items()
+        threading.Thread(target=claim_worker, args=(label, info))
+        for label, info in claimable.items()
     ]
     for t in threads:
         t.start()
@@ -302,7 +341,7 @@ def attempt_claims(offer_results):
         t.join(timeout=5)
 
     close_section()
-    return results
+    return claim_results
 
 # ─────────────────────────────────────────────
 #  SUMMARY
@@ -310,18 +349,18 @@ def attempt_claims(offer_results):
 def print_summary(offer_results, claim_results):
     section("SUMMARY")
     for acc in ACCOUNTS:
-        label  = acc["label"]
-        info   = offer_results.get(label, {})
-        claim  = (claim_results or {}).get(label)
+        label = acc["label"]
+        info  = offer_results.get(label, {})
+        claim = (claim_results or {}).get(label)
 
         if info.get("skip") or info.get("auth_failed") or info.get("api_error") or info.get("exception"):
-            status = "❌  Error — see Phase 3/4 output above"
+            status = "❌  Error — check Phase 3/4 output above"
         elif info.get("no_offers"):
             status = "⚠️   Not on Octoplus"
         elif info.get("slug"):
-            status = f"✅  Claimed" if claim == "claimed" else f"⚠️   Offer found but claim failed ({claim})"
+            status = "✅  Claimed" if claim == "claimed" else f"⚠️   Offer found but claim failed ({claim})"
         else:
-            status = "⏸   No claimable offer — vouchers taken or already claimed this week"
+            status = "⏸   No claimable offer — vouchers gone or already claimed this week"
 
         log("", label, status, indent=1)
     close_section()
