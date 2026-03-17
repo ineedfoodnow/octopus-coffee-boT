@@ -528,7 +528,6 @@ async def async_main() -> int:
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=10, write=10, pool=5),
-        http2=True,
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     ) as client:
         tasks = [asyncio.create_task(worker(account, client, end_ts), name=account.label) for account in accounts]
