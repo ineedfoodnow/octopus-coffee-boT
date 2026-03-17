@@ -55,7 +55,6 @@ query Offers($account: String!) {
           slug
           claimAbility {
             canClaimOffer
-            reasonCantClaim
           }
         }
       }
@@ -215,20 +214,6 @@ def load_accounts() -> list[Account]:
 
 
 def interpret_reason(reason: str | None) -> CheckState | None:
-    if not reason:
-        return None
-
-    text = reason.strip().lower()
-
-    if "already" in text and "claim" in text:
-        return CheckState.ALREADY_CLAIMED
-
-    if "claimed" in text and "this week" in text:
-        return CheckState.ALREADY_CLAIMED
-
-    if "not enrolled" in text or "join octoplus" in text:
-        return CheckState.NOT_ENROLLED
-
     return None
 
 
