@@ -13,20 +13,22 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-API_BACKEND = "https://api.octopus.energy/v1/graphql/"
-UK_TZ = ZoneInfo("Europe/London")
+# Auth uses the public endpoint; check/claim use the internal app endpoint
+API_AUTH     = "https://api.octopus.energy/v1/graphql/"
+API_INTERNAL = "https://api.backend.octopus.energy/v1/graphql/"
+UK_TZ        = ZoneInfo("Europe/London")
 
 FORCE_RUN = os.environ.get("FORCE_RUN", "false").lower() == "true"
 
-TARGET_HOUR = 5
-TARGET_MINUTE = 2
-TARGET_BUFFER_SECONDS = 10
-POLL_WINDOW_SECONDS = 20 * 60
-MAX_PRE_SLEEP_SECONDS = 10 * 60
-BASE_POLL_INTERVAL = 0.5
-SURGE_WINDOW_SECONDS = 30
-CLAIM_RETRIES = 3
-TOKEN_REFRESH_AFTER_SECONDS = 55 * 60
+TARGET_HOUR             = 5
+TARGET_MINUTE           = 2
+TARGET_BUFFER_SECONDS   = 10
+POLL_WINDOW_SECONDS     = 20 * 60
+MAX_PRE_SLEEP_SECONDS   = 10 * 60
+BASE_POLL_INTERVAL      = 0.5
+SURGE_WINDOW_SECONDS    = 30
+CLAIM_RETRIES           = 3
+TOKEN_REFRESH_AFTER     = 55 * 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +65,7 @@ query Offers($account: String!) {
           slug
           claimAbility {
             canClaimOffer
+            cannotClaimReason
           }
         }
       }
@@ -74,43 +77,43 @@ query Offers($account: String!) {
 GQL_CLAIM = """
 mutation Claim($account: String!, $slug: String!) {
   claimOctoplusReward(accountNumber: $account, offerSlug: $slug) {
-    success
+    rewardId
   }
 }
 """
 
 
 class CheckState(Enum):
-    CLAIMABLE = auto()
-    WAIT = auto()
+    CLAIMABLE      = auto()
+    WAIT           = auto()
     ALREADY_CLAIMED = auto()
-    NOT_ENROLLED = auto()
-    NO_GROUPS = auto()
-    API_ERROR = auto()
+    NOT_ENROLLED   = auto()
+    NO_GROUPS      = auto()
+    API_ERROR      = auto()
 
 
 class WorkerResult(Enum):
-    CLAIMED = auto()
+    CLAIMED        = auto()
     ALREADY_CLAIMED = auto()
-    NOT_ENROLLED = auto()
-    NO_GROUPS = auto()
+    NOT_ENROLLED   = auto()
+    NO_GROUPS      = auto()
     WINDOW_EXPIRED = auto()
-    MISSING_CREDS = auto()
-    TOKEN_FAILED = auto()
-    CLAIM_FAILED = auto()
-    API_ERROR = auto()
+    MISSING_CREDS  = auto()
+    TOKEN_FAILED   = auto()
+    CLAIM_FAILED   = auto()
+    API_ERROR      = auto()
 
 
 RESULT_LABEL = {
-    WorkerResult.CLAIMED: "✅  Claimed successfully",
+    WorkerResult.CLAIMED:         "✅  Claimed successfully",
     WorkerResult.ALREADY_CLAIMED: "⏸   Already claimed this week",
-    WorkerResult.NOT_ENROLLED: "❌  Not enrolled in Octoplus",
-    WorkerResult.NO_GROUPS: "⚠️   No Octoplus offer groups returned",
-    WorkerResult.WINDOW_EXPIRED: "⏸   Window expired — no claimable offer found",
-    WorkerResult.MISSING_CREDS: "❌  Missing credentials",
-    WorkerResult.TOKEN_FAILED: "❌  Token exchange failed",
-    WorkerResult.CLAIM_FAILED: "❌  Claim failed after retries",
-    WorkerResult.API_ERROR: "❌  API error",
+    WorkerResult.NOT_ENROLLED:    "❌  Not enrolled in Octoplus",
+    WorkerResult.NO_GROUPS:       "⚠️   No Octoplus offer groups returned",
+    WorkerResult.WINDOW_EXPIRED:  "⏸   Window expired — no claimable offer found",
+    WorkerResult.MISSING_CREDS:   "❌  Missing credentials",
+    WorkerResult.TOKEN_FAILED:    "❌  Token exchange failed",
+    WorkerResult.CLAIM_FAILED:    "❌  Claim failed after retries",
+    WorkerResult.API_ERROR:       "❌  API error",
 }
 
 
@@ -132,23 +135,22 @@ class Account:
 @dataclass
 class CheckOutcome:
     state: CheckState
-    slug: str | None = None
+    slug: str | None  = None
     reason: str | None = None
-    code: str | None = None
-    raw_offer_count: int = 0
+    code: str | None  = None
 
 
 @dataclass
 class TokenManager:
     account: Account
     client: httpx.AsyncClient
-    token: str | None = field(default=None, init=False)
-    refresh_token: str | None = field(default=None, init=False)
-    acquired_monotonic: float = field(default=0.0, init=False)
+    token: str | None              = field(default=None, init=False)
+    refresh_token: str | None      = field(default=None, init=False)
+    acquired_monotonic: float      = field(default=0.0,  init=False)
 
     async def get_valid_token(self) -> str | None:
         age = time.monotonic() - self.acquired_monotonic
-        if self.token and age < TOKEN_REFRESH_AFTER_SECONDS:
+        if self.token and age < TOKEN_REFRESH_AFTER:
             return self.token
         if self.refresh_token:
             token = await self._refresh()
@@ -157,46 +159,28 @@ class TokenManager:
         return await self._authenticate()
 
     async def _authenticate(self) -> str | None:
-        return await self._exchange(
-            query=GQL_OBTAIN_TOKEN,
-            variables={"apiKey": self.account.api_key},
-            auth=False,
-            action="API key auth",
-        )
+        return await self._exchange(GQL_OBTAIN_TOKEN, {"apiKey": self.account.api_key}, "API key auth")
 
     async def _refresh(self) -> str | None:
-        return await self._exchange(
-            query=GQL_REFRESH_TOKEN,
-            variables={"refreshToken": self.refresh_token},
-            auth=False,
-            action="token refresh",
-        )
+        return await self._exchange(GQL_REFRESH_TOKEN, {"refreshToken": self.refresh_token}, "token refresh")
 
-    async def _exchange(
-        self,
-        query: str,
-        variables: dict[str, Any],
-        auth: bool,
-        action: str,
-    ) -> str | None:
+    async def _exchange(self, query: str, variables: dict[str, Any], action: str) -> str | None:
         try:
-            headers = {"Authorization": self.token} if auth and self.token else {}
-            response = await self.client.post(
-                API_BACKEND,
-                headers=headers,
+            r = await self.client.post(
+                API_AUTH,
                 json={"query": query, "variables": variables},
             )
-            response.raise_for_status()
-            payload = response.json()
+            r.raise_for_status()
+            payload    = r.json()
             token_data = (payload.get("data") or {}).get("obtainKrakenToken") or {}
-            token = token_data.get("token")
+            token      = token_data.get("token")
             if token:
-                self.token = token
-                self.refresh_token = token_data.get("refreshToken")
+                self.token             = token
+                self.refresh_token     = token_data.get("refreshToken")
                 self.acquired_monotonic = time.monotonic()
                 log.info("[%s] Auth OK via %s", self.account.label, action)
                 return token
-            log.error("[%s] No token returned during %s: %s", self.account.label, action, payload.get("errors"))
+            log.error("[%s] No token during %s: %s", self.account.label, action, payload.get("errors"))
             return None
         except httpx.HTTPStatusError as exc:
             log.error("[%s] Auth HTTP %s during %s", self.account.label, exc.response.status_code, action)
@@ -228,49 +212,13 @@ def adaptive_interval(end_ts: float) -> float:
     return 0.1 + (BASE_POLL_INTERVAL - 0.1) * (remaining / SURGE_WINDOW_SECONDS)
 
 
-def build_times() -> tuple[float, float]:
-    now = datetime.now(UK_TZ)
-    target = now.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
-    hard_cutoff = now.replace(hour=5, minute=0, second=0, microsecond=0).timestamp() + POLL_WINDOW_SECONDS
-    return target.timestamp(), hard_cutoff
-
-
-async def wait_for_target() -> tuple[bool, float]:
-    now = datetime.now(UK_TZ)
-    target_ts, end_ts = build_times()
-
-    log.info("Current UK time: %s", now.strftime("%A %d %b %Y %H:%M:%S %Z"))
-    log.info("Target claim polling starts at %02d:%02d UK", TARGET_HOUR, TARGET_MINUTE)
-    log.info("Hard cutoff is %s", datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S %Z"))
-
-    if FORCE_RUN:
-        log.info("FORCE_RUN enabled — bypassing time guard with 2-minute test window")
-        return True, time.time() + 120
-
-    secs_to_target = target_ts - now.timestamp()
-    secs_to_end = end_ts - now.timestamp()
-
-    if secs_to_end <= 0:
-        log.info("Past hard cutoff — stale trigger, exiting")
-        return False, 0
-
-    if secs_to_target > MAX_PRE_SLEEP_SECONDS:
-        log.info("Trigger arrived too early (%.0fs before target) — exiting", secs_to_target)
-        return False, 0
-
-    wake_ts = target_ts - TARGET_BUFFER_SECONDS
-    sleep_s = wake_ts - now.timestamp()
-
-    if sleep_s > 0:
-        log.info("Sleeping %.1fs — waking %ds before target", sleep_s, TARGET_BUFFER_SECONDS)
-        await asyncio.sleep(sleep_s)
-    else:
-        log.info("Already inside polling window — starting immediately")
-
-    return True, end_ts
-
-
 def interpret_reason(reason: str | None) -> CheckState | None:
+    if not reason:
+        return None
+    if reason == "MAX_CLAIMS_PER_PERIOD_REACHED":
+        return CheckState.ALREADY_CLAIMED
+    if reason == "OUT_OF_STOCK":
+        return None  # Keep polling — codes not dropped yet
     return None
 
 
@@ -281,19 +229,19 @@ async def check_reward(
     verbose: bool = False,
 ) -> CheckOutcome:
     try:
-        response = await client.post(
-            API_BACKEND,
+        r = await client.post(
+            API_INTERNAL,
             headers={"Authorization": token},
             json={"query": GQL_CHECK, "variables": {"account": account.account_number}},
         )
-        response.raise_for_status()
-        payload = response.json()
-        errors = payload.get("errors") or []
+        r.raise_for_status()
+        payload = r.json()
+        errors  = payload.get("errors") or []
 
         if errors:
             first = errors[0]
-            code = (first.get("extensions") or {}).get("errorCode")
-            msg = first.get("message", "")
+            code  = (first.get("extensions") or {}).get("errorCode")
+            msg   = first.get("message", "")
 
             if code == "KT-GB-9319":
                 if verbose:
@@ -308,9 +256,8 @@ async def check_reward(
             return CheckOutcome(state=CheckState.API_ERROR, code=code, reason=msg)
 
         groups = (payload.get("data") or {}).get("octoplusOfferGroups") or {}
-        edges = groups.get("edges") or []
+        edges  = groups.get("edges") or []
 
-        offers_seen = 0
         if verbose:
             log.info("[%s] %d offer group(s) returned", account.label, len(edges))
 
@@ -320,43 +267,26 @@ async def check_reward(
 
         for group in edges:
             for offer in group.get("node", {}).get("octoplusOffers") or []:
-                offers_seen += 1
-                slug = offer.get("slug", "unknown")
-                claim_ability = offer.get("claimAbility") or {}
-                can_claim = bool(claim_ability.get("canClaimOffer"))
-                reason = claim_ability.get("reasonCantClaim")
+                slug      = offer.get("slug", "unknown")
+                ability   = offer.get("claimAbility") or {}
+                can_claim = bool(ability.get("canClaimOffer"))
+                reason    = ability.get("cannotClaimReason")
 
                 if verbose:
                     if can_claim:
-                        log.info("[%s] slug=%s  ✅ CLAIMABLE", account.label, slug)
+                        log.info("[%s] slug=%-40s ✅ CLAIMABLE", account.label, slug)
                     else:
-                        log.info("[%s] slug=%s  ⏸ %s", account.label, slug, reason or "not claimable")
+                        log.info("[%s] slug=%-40s ⏸  %s", account.label, slug, reason or "not claimable")
 
                 if can_claim:
-                    return CheckOutcome(
-                        state=CheckState.CLAIMABLE,
-                        slug=slug,
-                        reason=reason,
-                        raw_offer_count=offers_seen,
-                    )
+                    return CheckOutcome(state=CheckState.CLAIMABLE, slug=slug)
 
                 inferred = interpret_reason(reason)
                 if inferred == CheckState.ALREADY_CLAIMED:
-                    return CheckOutcome(
-                        state=CheckState.ALREADY_CLAIMED,
-                        slug=slug,
-                        reason=reason,
-                        raw_offer_count=offers_seen,
-                    )
-                if inferred == CheckState.NOT_ENROLLED:
-                    return CheckOutcome(
-                        state=CheckState.NOT_ENROLLED,
-                        slug=slug,
-                        reason=reason,
-                        raw_offer_count=offers_seen,
-                    )
+                    log.info("[%s] Already claimed this week (%s)", account.label, reason)
+                    return CheckOutcome(state=CheckState.ALREADY_CLAIMED, reason=reason)
 
-        return CheckOutcome(state=CheckState.WAIT, raw_offer_count=offers_seen)
+        return CheckOutcome(state=CheckState.WAIT)
 
     except httpx.HTTPStatusError as exc:
         log.warning("[%s] Check HTTP %s", account.label, exc.response.status_code)
@@ -374,33 +304,30 @@ async def claim_reward(
 ) -> bool:
     for attempt in range(1, CLAIM_RETRIES + 1):
         try:
-            log.info("[%s] Claim attempt %d/%d for slug=%s", account.label, attempt, CLAIM_RETRIES, slug)
-            response = await client.post(
-                API_BACKEND,
+            log.info("[%s] Claim attempt %d/%d slug=%s", account.label, attempt, CLAIM_RETRIES, slug)
+            r = await client.post(
+                API_INTERNAL,
                 headers={"Authorization": token},
                 json={
                     "query": GQL_CLAIM,
-                    "variables": {
-                        "account": account.account_number,
-                        "slug": slug,
-                    },
+                    "variables": {"account": account.account_number, "slug": slug},
                 },
             )
-            response.raise_for_status()
-            payload = response.json()
-            success = ((payload.get("data") or {}).get("claimOctoplusReward") or {}).get("success", False)
+            r.raise_for_status()
+            payload   = r.json()
+            reward_id = ((payload.get("data") or {}).get("claimOctoplusReward") or {}).get("rewardId")
 
-            if success:
+            if reward_id:
+                log.info("[%s] Claimed! Reward ID: %s", account.label, reward_id)
                 return True
 
             errors = payload.get("errors") or []
             if errors:
-                first = errors[0]
-                msg = first.get("message", str(payload))
-                code = (first.get("extensions") or {}).get("errorCode")
+                msg  = errors[0].get("message", str(payload))
+                code = (errors[0].get("extensions") or {}).get("errorCode")
                 log.warning("[%s] Claim rejected: %s (%s)", account.label, msg, code)
             else:
-                log.warning("[%s] Claim unsuccessful: %s", account.label, payload)
+                log.warning("[%s] No rewardId in response: %s", account.label, payload)
 
         except httpx.HTTPStatusError as exc:
             log.warning("[%s] Claim HTTP %s", account.label, exc.response.status_code)
@@ -409,6 +336,7 @@ async def claim_reward(
 
         if attempt < CLAIM_RETRIES:
             backoff = 2 ** (attempt - 1)
+            log.info("[%s] Retrying in %ds...", account.label, backoff)
             await asyncio.sleep(backoff)
 
     return False
@@ -421,39 +349,39 @@ async def worker(account: Account, client: httpx.AsyncClient, end_ts: float) -> 
         log.error("[%s] Missing credentials", account.label)
         return WorkerResult.MISSING_CREDS
 
-    token_mgr = TokenManager(account=account, client=client)
-    token = await token_mgr.get_valid_token()
+    tm    = TokenManager(account=account, client=client)
+    token = await tm.get_valid_token()
     if not token:
         return WorkerResult.TOKEN_FAILED
 
-    polls = 0
+    polls          = 0
     start_monotonic = time.monotonic()
 
     while time.time() < end_ts:
-        token = await token_mgr.get_valid_token()
+        token = await tm.get_valid_token()
         if not token:
             return WorkerResult.TOKEN_FAILED
 
         verbose = polls == 0 or polls % max(1, int(120 / BASE_POLL_INTERVAL)) == 0
         outcome = await check_reward(client, token, account, verbose=verbose)
-        polls += 1
+        polls  += 1
 
         if outcome.state == CheckState.CLAIMABLE and outcome.slug:
             elapsed = time.monotonic() - start_monotonic
-            log.info("[%s] Offer found after %d polls (%.1fs): %s", account.label, polls, elapsed, outcome.slug)
+            log.info("[%s] 🎟  Offer found after %d polls (%.1fs): %s",
+                     account.label, polls, elapsed, outcome.slug)
 
-            token = await token_mgr.get_valid_token()
+            token = await tm.get_valid_token()
             if not token:
                 return WorkerResult.TOKEN_FAILED
 
-            claimed = await claim_reward(client, token, account, outcome.slug)
-            if claimed:
-                log.info("[%s] Claimed successfully after %.1fs", account.label, time.monotonic() - start_monotonic)
+            if await claim_reward(client, token, account, outcome.slug):
+                log.info("[%s] 🎉 Done in %.1fs after %d polls",
+                         account.label, time.monotonic() - start_monotonic, polls)
                 return WorkerResult.CLAIMED
             return WorkerResult.CLAIM_FAILED
 
         if outcome.state == CheckState.ALREADY_CLAIMED:
-            log.info("[%s] Already claimed — %s", account.label, outcome.reason or "detected from API")
             return WorkerResult.ALREADY_CLAIMED
 
         if outcome.state == CheckState.NOT_ENROLLED:
@@ -462,28 +390,66 @@ async def worker(account: Account, client: httpx.AsyncClient, end_ts: float) -> 
         if outcome.state == CheckState.NO_GROUPS:
             return WorkerResult.NO_GROUPS
 
-        if outcome.state == CheckState.API_ERROR:
-            log.warning("[%s] Non-fatal API error — continuing until cutoff", account.label)
-
         await asyncio.sleep(adaptive_interval(end_ts))
 
-    log.info("[%s] Window closed after %d polls — no claimable offer found", account.label, polls)
+    log.info("[%s] Window closed after %d polls — no offer found", account.label, polls)
     return WorkerResult.WINDOW_EXPIRED
 
 
+def build_times() -> tuple[float, float]:
+    now    = datetime.now(UK_TZ)
+    target = now.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
+    end    = now.replace(hour=5,           minute=0,             second=0, microsecond=0).timestamp() + POLL_WINDOW_SECONDS
+    return target.timestamp(), end
+
+
+async def wait_for_target() -> tuple[bool, float]:
+    now              = datetime.now(UK_TZ)
+    target_ts, end_ts = build_times()
+
+    log.info("Current UK time: %s", now.strftime("%A %d %b %Y %H:%M:%S %Z"))
+    log.info("Target: %02d:%02d UK  |  Cutoff: %s",
+             TARGET_HOUR, TARGET_MINUTE,
+             datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S"))
+
+    if FORCE_RUN:
+        log.info("FORCE_RUN — bypassing time guard, 2-minute window")
+        return True, time.time() + 120
+
+    if end_ts - time.time() <= 0:
+        log.info("Past hard cutoff — stale trigger, exiting")
+        return False, 0
+
+    secs_to_target = target_ts - time.time()
+    if secs_to_target > MAX_PRE_SLEEP_SECONDS:
+        log.info("Trigger too early (%.0fs before target) — exiting", secs_to_target)
+        return False, 0
+
+    wake_ts = target_ts - TARGET_BUFFER_SECONDS
+    sleep_s = wake_ts - time.time()
+    if sleep_s > 0:
+        log.info("Sleeping %.1fs — waking %ds before target", sleep_s, TARGET_BUFFER_SECONDS)
+        await asyncio.sleep(sleep_s)
+    else:
+        log.info("Already inside polling window — starting immediately")
+
+    return True, end_ts
+
+
 def print_summary(accounts: list[Account], results: list[WorkerResult]) -> None:
-    width = 60
-    print("\n" + "═" * width)
-    print(f"{'SUMMARY':^{width}}")
-    print("═" * width)
+    w = 60
+    print("\n" + "═" * w)
+    print(f"{'SUMMARY':^{w}}")
+    print("═" * w)
     for account, result in zip(accounts, results):
-        print(f"{account.label:<14} {RESULT_LABEL[result]}")
-    print("═" * width + "\n")
+        print(f"  {account.label:<14} {RESULT_LABEL[result]}")
+    print("═" * w + "\n")
 
 
 def resolve_exit_code(results: list[WorkerResult]) -> int:
-    failures = {WorkerResult.MISSING_CREDS, WorkerResult.TOKEN_FAILED, WorkerResult.CLAIM_FAILED, WorkerResult.API_ERROR}
-    count = sum(1 for result in results if result in failures)
+    failures = {WorkerResult.MISSING_CREDS, WorkerResult.TOKEN_FAILED,
+                WorkerResult.CLAIM_FAILED, WorkerResult.API_ERROR}
+    count = sum(1 for r in results if r in failures)
     if count == 0:
         return 0
     if count == len(results):
@@ -493,14 +459,14 @@ def resolve_exit_code(results: list[WorkerResult]) -> int:
 
 async def async_main() -> int:
     print("════════════════════════════════════════════════════════════")
-    print("OCTOPUS COFFEE BOT · PRODUCTION")
-    print(datetime.now(UK_TZ).strftime("%A %d %b %Y %H:%M:%S %Z"))
-    print("Mode:", "FORCE_RUN" if FORCE_RUN else "Scheduled")
+    print("  OCTOPUS COFFEE BOT · PRODUCTION")
+    print(f"  {datetime.now(UK_TZ).strftime('%A %d %b %Y %H:%M:%S %Z')}")
+    print(f"  Mode: {'⚡ FORCE_RUN' if FORCE_RUN else '🕐 Scheduled'}")
     print("════════════════════════════════════════════════════════════")
 
     accounts = load_accounts()
     if not accounts:
-        log.error("No accounts found. Set OCTO_APIKEY_1/OCTO_ACC_1 etc.")
+        log.error("No accounts found — set OCTO_APIKEY_1/OCTO_ACC_1 etc.")
         return 1
 
     log.info("Loaded %d account(s)", len(accounts))
@@ -509,26 +475,27 @@ async def async_main() -> int:
     if not should_run:
         return 0
 
-    log.info("Polling will stop at %s", datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S %Z"))
+    log.info("Polling open until %s",
+             datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S %Z"))
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=10, write=10, pool=5),
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     ) as client:
-        tasks = [asyncio.create_task(worker(account, client, end_ts), name=account.label) for account in accounts]
+        tasks       = [asyncio.create_task(worker(acc, client, end_ts), name=acc.label) for acc in accounts]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list[WorkerResult] = []
-    for account, result in zip(accounts, raw_results):
-        if isinstance(result, BaseException):
-            log.error("[%s] Unhandled exception: %s", account.label, result, exc_info=result)
+    for acc, res in zip(accounts, raw_results):
+        if isinstance(res, BaseException):
+            log.error("[%s] Unhandled exception: %s", acc.label, res, exc_info=res)
             results.append(WorkerResult.CLAIM_FAILED)
         else:
-            results.append(result)
+            results.append(res)
 
     print_summary(accounts, results)
     code = resolve_exit_code(results)
-    log.info("Finished with exit code %d", code)
+    log.info("Exit code %d", code)
     return code
 
 
