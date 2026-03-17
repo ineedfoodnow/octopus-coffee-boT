@@ -1,54 +1,61 @@
-import requests
-import time
-import threading
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
 import sys
-from zoneinfo import ZoneInfo
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum, auto
+from typing import Any
+from zoneinfo import ZoneInfo
 
-# ─────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────
+import httpx
+
 API_BACKEND = "https://api.octopus.energy/v1/graphql/"
-UK_TZ       = ZoneInfo("Europe/London")
-POLL_WINDOW = 2 * 60
-FORCE_RUN   = os.environ.get("FORCE_RUN", "true").lower() == "true"
+UK_TZ = ZoneInfo("Europe/London")
 
-ACCOUNTS = [
-    {
-        "label":   "Account 1",
-        "api_key": os.environ.get("OCTO_APIKEY_1", "").strip(),
-        "account": os.environ.get("OCTO_ACC_1", "").strip(),
-    },
-    {
-        "label":   "Account 2",
-        "api_key": os.environ.get("OCTO_APIKEY_2", "").strip(),
-        "account": os.environ.get("OCTO_ACC_2", "").strip(),
-    },
-    {
-        "label":   "Account 3",
-        "api_key": os.environ.get("OCTO_APIKEY_3", "").strip(),
-        "account": os.environ.get("OCTO_ACC_3", "").strip(),
-    },
-]
+TEST_WINDOW_SECONDS = 120
+TOKEN_REFRESH_AFTER_SECONDS = 55 * 60
+CLAIM_RETRIES = 2
 
-OBTAIN_TOKEN_MUTATION = """
-mutation ObtainToken($apiKey: String!){
-  obtainKrakenToken(input: { APIKey: $apiKey }){
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("octopus-test-bot")
+
+GQL_OBTAIN_TOKEN = """
+mutation ObtainToken($apiKey: String!) {
+  obtainKrakenToken(input: { APIKey: $apiKey }) {
     token
+    refreshToken
   }
 }
 """
 
-CHECK_QUERY = """
-query Offers($account:String!){
-  octoplusOfferGroups(accountNumber:$account, first:10){
-    edges{
-      node{
-        octoplusOffers{
+GQL_REFRESH_TOKEN = """
+mutation RefreshToken($refreshToken: String!) {
+  obtainKrakenToken(input: { refreshToken: $refreshToken }) {
+    token
+    refreshToken
+  }
+}
+"""
+
+GQL_CHECK = """
+query Offers($account: String!) {
+  octoplusOfferGroups(accountNumber: $account, first: 10) {
+    edges {
+      node {
+        octoplusOffers {
           slug
-          claimAbility{
+          claimAbility {
             canClaimOffer
+            reasonCantClaim
           }
         }
       }
@@ -57,350 +64,389 @@ query Offers($account:String!){
 }
 """
 
-CLAIM_MUTATION = """
-mutation Claim($account:String!,$slug:String!){
-  claimOctoplusReward(accountNumber:$account,offerSlug:$slug){
+GQL_CLAIM = """
+mutation Claim($account: String!, $slug: String!) {
+  claimOctoplusReward(accountNumber: $account, offerSlug: $slug) {
     success
   }
 }
 """
 
-# ─────────────────────────────────────────────
-#  LOGGING HELPERS
-# ─────────────────────────────────────────────
-def divider(char="─", width=56):
-    print(char * width)
 
-def header(title):
-    divider("═")
-    pad = (56 - len(title) - 2) // 2
-    print(f"{'═' * pad} {title} {'═' * (56 - pad - len(title) - 2)}")
-    divider("═")
+class CheckState(Enum):
+    CLAIMABLE = auto()
+    WAIT = auto()
+    ALREADY_CLAIMED = auto()
+    NOT_ENROLLED = auto()
+    NO_GROUPS = auto()
+    API_ERROR = auto()
 
-def section(title):
-    print()
-    print(f"  ┌─ {title}")
 
-def log(icon, label, msg, indent=2):
-    prefix = "  │  " + "  " * indent
-    print(f"{prefix}{icon} {label}: {msg}")
+class TestResult(Enum):
+    CLAIMED = auto()
+    CLAIMABLE_FOUND = auto()
+    ALREADY_CLAIMED = auto()
+    NOT_ENROLLED = auto()
+    NO_GROUPS = auto()
+    NO_CLAIMABLE_OFFER = auto()
+    MISSING_CREDS = auto()
+    TOKEN_FAILED = auto()
+    CLAIM_FAILED = auto()
+    API_ERROR = auto()
 
-def result(icon, msg, indent=2):
-    prefix = "  │  " + "  " * indent
-    print(f"{prefix}{icon} {msg}")
 
-def close_section():
-    print("  └" + "─" * 54)
+RESULT_LABEL = {
+    TestResult.CLAIMED: "✅  Claimed successfully",
+    TestResult.CLAIMABLE_FOUND: "✅  Offer is claimable now",
+    TestResult.ALREADY_CLAIMED: "⏸   Already claimed this week",
+    TestResult.NOT_ENROLLED: "❌  Not enrolled in Octoplus",
+    TestResult.NO_GROUPS: "⚠️   No Octoplus offer groups returned",
+    TestResult.NO_CLAIMABLE_OFFER: "⏸   No claimable offer right now",
+    TestResult.MISSING_CREDS: "❌  Missing credentials",
+    TestResult.TOKEN_FAILED: "❌  Token exchange failed",
+    TestResult.CLAIM_FAILED: "❌  Claim failed after retries",
+    TestResult.API_ERROR: "❌  API error",
+}
 
-def mask(val):
-    return (val[:4] + "••••••") if val else "── NOT SET ──"
 
-# ─────────────────────────────────────────────
-#  PHASE 1 — SECRETS
-# ─────────────────────────────────────────────
-def check_secrets():
-    section("PHASE 1 — Secrets")
-    all_ok = True
-    for acc in ACCOUNTS:
-        key_ok = bool(acc["api_key"])
-        acc_ok = bool(acc["account"])
-        icon   = "✅" if (key_ok and acc_ok) else "❌"
-        log(icon, acc["label"],
-            f"api_key={mask(acc['api_key'])}  account={mask(acc['account'])}")
-        if not (key_ok and acc_ok):
-            all_ok = False
-    if not all_ok:
-        result("⛔", "One or more secrets missing — check repo Settings → Secrets")
-    close_section()
-    return all_ok
+@dataclass(frozen=True)
+class Account:
+    label: str
+    api_key: str
+    account_number: str
 
-# ─────────────────────────────────────────────
-#  PHASE 2 — TIMEZONE
-# ─────────────────────────────────────────────
-def check_timezone():
-    section("PHASE 2 — Timezone & Schedule Logic")
-    now       = datetime.now(UK_TZ)
-    weekday   = now.weekday()
-    day_name  = now.strftime("%A")
-    today_5am = now.replace(hour=5, minute=0, second=0, microsecond=0)
-    secs      = (today_5am - now).total_seconds()
+    @property
+    def is_valid(self) -> bool:
+        return bool(self.api_key and self.account_number)
 
-    log("🌍", "Current UK time", now.strftime("%A %d %b %Y  %H:%M:%S %Z"))
-    log("📅", "Valid run day",
-        f"{'✅ Yes' if weekday in range(4) else '⚠️  No (bot skips Fri–Sun in production)'}  ({day_name})")
+    @property
+    def masked(self) -> str:
+        return (self.account_number[:4] + "••••••") if self.account_number else "── NOT SET ──"
 
-    if secs > 0:
-        log("⏳", "Time until 5am UK", f"{secs:.0f}s  ({secs/60:.1f} min)")
-    else:
-        log("⏰", "Time past 5am UK",  f"{abs(secs):.0f}s  ({abs(secs)/60:.1f} min ago)")
 
-    if FORCE_RUN:
-        result("⚡", "FORCE_RUN=true — time guard bypassed for this test")
+@dataclass
+class CheckOutcome:
+    state: CheckState
+    slug: str | None = None
+    reason: str | None = None
+    code: str | None = None
+    raw_offer_count: int = 0
 
-    close_section()
 
-# ─────────────────────────────────────────────
-#  PHASE 3 — CONNECTIVITY
-# ─────────────────────────────────────────────
-def check_api_connectivity():
-    section("PHASE 3 — API Connectivity")
-    try:
-        r = requests.post(
-            API_BACKEND,
-            json={"query": "{ __typename }"},
-            timeout=8,
+@dataclass
+class TokenManager:
+    account: Account
+    client: httpx.AsyncClient
+    token: str | None = field(default=None, init=False)
+    refresh_token: str | None = field(default=None, init=False)
+    acquired_monotonic: float = field(default=0.0, init=False)
+
+    async def get_valid_token(self) -> str | None:
+        age = time.monotonic() - self.acquired_monotonic
+        if self.token and age < TOKEN_REFRESH_AFTER_SECONDS:
+            return self.token
+        if self.refresh_token:
+            token = await self._refresh()
+            if token:
+                return token
+        return await self._authenticate()
+
+    async def _authenticate(self) -> str | None:
+        return await self._exchange(
+            query=GQL_OBTAIN_TOKEN,
+            variables={"apiKey": self.account.api_key},
+            auth=False,
+            action="API key auth",
         )
-        reachable = r.status_code in (200, 400)
-        icon      = "🌐" if reachable else "❌"
-        log(icon, "Octopus API reachable", f"HTTP {r.status_code}")
-        close_section()
-        return reachable
-    except Exception as e:
-        log("❌", "Octopus API unreachable", str(e))
-        result("⛔", "Cannot proceed — network issue")
-        close_section()
-        return False
 
-# ─────────────────────────────────────────────
-#  TOKEN EXCHANGE
-# ─────────────────────────────────────────────
-def get_auth_token(api_key, label=""):
-    try:
-        r = requests.post(
-            API_BACKEND,
-            json={
-                "query": OBTAIN_TOKEN_MUTATION,
-                "variables": {"apiKey": api_key},
-            },
-            timeout=10,
+    async def _refresh(self) -> str | None:
+        return await self._exchange(
+            query=GQL_REFRESH_TOKEN,
+            variables={"refreshToken": self.refresh_token},
+            auth=False,
+            action="token refresh",
         )
-        data  = r.json()
-        token = (
-            data.get("data", {})
-                .get("obtainKrakenToken", {})
-                .get("token")
-        )
-        if not token:
-            print(f"  │        ⛔ Token exchange failed: {data.get('errors', data)}")
-        return token
-    except Exception as e:
-        print(f"  │        ⛔ Token exchange error: {e}")
+
+    async def _exchange(
+        self,
+        query: str,
+        variables: dict[str, Any],
+        auth: bool,
+        action: str,
+    ) -> str | None:
+        try:
+            headers = {"Authorization": self.token} if auth and self.token else {}
+            response = await self.client.post(
+                API_BACKEND,
+                headers=headers,
+                json={"query": query, "variables": variables},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            token_data = (payload.get("data") or {}).get("obtainKrakenToken") or {}
+            token = token_data.get("token")
+            if token:
+                self.token = token
+                self.refresh_token = token_data.get("refreshToken")
+                self.acquired_monotonic = time.monotonic()
+                log.info("[%s] Auth OK via %s", self.account.label, action)
+                return token
+            log.error("[%s] No token returned during %s: %s", self.account.label, action, payload.get("errors"))
+            return None
+        except httpx.HTTPStatusError as exc:
+            log.error("[%s] Auth HTTP %s during %s", self.account.label, exc.response.status_code, action)
+            return None
+        except Exception as exc:
+            log.error("[%s] Auth error during %s: %s", self.account.label, action, exc)
+            return None
+
+
+def load_accounts() -> list[Account]:
+    accounts: list[Account] = []
+    i = 1
+    while True:
+        api_key = os.environ.get(f"OCTO_APIKEY_{i}", "").strip()
+        account = os.environ.get(f"OCTO_ACC_{i}", "").strip()
+        if not api_key and not account:
+            break
+        accounts.append(Account(label=f"Account {i}", api_key=api_key, account_number=account))
+        i += 1
+    return accounts
+
+
+def interpret_reason(reason: str | None) -> CheckState | None:
+    if not reason:
         return None
 
-# ─────────────────────────────────────────────
-#  PHASE 4 — AUTH & OFFER CHECK
-# ─────────────────────────────────────────────
-def check_offers():
-    section("PHASE 4 — Auth & Offer Status per Account")
-    results = {}
+    text = reason.strip().lower()
 
-    for acc in ACCOUNTS:
-        label   = acc["label"]
-        api_key = acc["api_key"]
-        account = acc["account"]
-        print(f"  │")
-        print(f"  │  ▸ {label}  ({mask(account)})")
+    if "already" in text and "claim" in text:
+        return CheckState.ALREADY_CLAIMED
 
-        if not api_key or not account:
-            result("⚠️ ", "Skipped — missing credentials", indent=3)
-            results[label] = {"skip": True}
-            continue
+    if "claimed" in text and "this week" in text:
+        return CheckState.ALREADY_CLAIMED
 
-        log("🔑", "Exchanging API key for token", "", indent=3)
-        token = get_auth_token(api_key, label)
-        if not token:
-            result("❌", "Token exchange failed — check api_key is correct", indent=3)
-            results[label] = {"auth_failed": True}
-            continue
+    if "not enrolled" in text or "join octoplus" in text:
+        return CheckState.NOT_ENROLLED
 
-        log("✅", "Token obtained", "", indent=3)
+    return None
 
+
+async def check_reward(
+    client: httpx.AsyncClient,
+    token: str,
+    account: Account,
+    verbose: bool = True,
+) -> CheckOutcome:
+    try:
+        response = await client.post(
+            API_BACKEND,
+            headers={"Authorization": token},
+            json={"query": GQL_CHECK, "variables": {"account": account.account_number}},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        errors = payload.get("errors") or []
+
+        if errors:
+            first = errors[0]
+            code = (first.get("extensions") or {}).get("errorCode")
+            msg = first.get("message", "")
+
+            if code == "KT-GB-9319":
+                log.info("[%s] Offers not available yet (%s)", account.label, code)
+                return CheckOutcome(state=CheckState.WAIT, code=code, reason=msg)
+
+            if code == "KT-GB-9316":
+                log.warning("[%s] Not enrolled in Octoplus (%s)", account.label, code)
+                return CheckOutcome(state=CheckState.NOT_ENROLLED, code=code, reason=msg)
+
+            log.warning("[%s] API error %s: %s", account.label, code, msg)
+            return CheckOutcome(state=CheckState.API_ERROR, code=code, reason=msg)
+
+        groups = (payload.get("data") or {}).get("octoplusOfferGroups") or {}
+        edges = groups.get("edges") or []
+
+        log.info("[%s] %d offer group(s) returned", account.label, len(edges))
+
+        if not edges:
+            log.warning("[%s] No offer groups returned", account.label)
+            return CheckOutcome(state=CheckState.NO_GROUPS)
+
+        offers_seen = 0
+        for group in edges:
+            for offer in group.get("node", {}).get("octoplusOffers") or []:
+                offers_seen += 1
+                slug = offer.get("slug", "unknown")
+                claim_ability = offer.get("claimAbility") or {}
+                can_claim = bool(claim_ability.get("canClaimOffer"))
+                reason = claim_ability.get("reasonCantClaim")
+
+                if can_claim:
+                    log.info("[%s] slug=%s  ✅ CLAIMABLE", account.label, slug)
+                    return CheckOutcome(
+                        state=CheckState.CLAIMABLE,
+                        slug=slug,
+                        reason=reason,
+                        raw_offer_count=offers_seen,
+                    )
+
+                log.info("[%s] slug=%s  ⏸ %s", account.label, slug, reason or "not claimable")
+
+                inferred = interpret_reason(reason)
+                if inferred == CheckState.ALREADY_CLAIMED:
+                    return CheckOutcome(
+                        state=CheckState.ALREADY_CLAIMED,
+                        slug=slug,
+                        reason=reason,
+                        raw_offer_count=offers_seen,
+                    )
+                if inferred == CheckState.NOT_ENROLLED:
+                    return CheckOutcome(
+                        state=CheckState.NOT_ENROLLED,
+                        slug=slug,
+                        reason=reason,
+                        raw_offer_count=offers_seen,
+                    )
+
+        return CheckOutcome(state=CheckState.WAIT, raw_offer_count=offers_seen)
+
+    except httpx.HTTPStatusError as exc:
+        log.warning("[%s] Check HTTP %s", account.label, exc.response.status_code)
+        return CheckOutcome(state=CheckState.API_ERROR, reason=f"HTTP {exc.response.status_code}")
+    except Exception as exc:
+        log.warning("[%s] Check error: %s", account.label, exc)
+        return CheckOutcome(state=CheckState.API_ERROR, reason=str(exc))
+
+
+async def claim_reward(
+    client: httpx.AsyncClient,
+    token: str,
+    account: Account,
+    slug: str,
+) -> bool:
+    for attempt in range(1, CLAIM_RETRIES + 1):
         try:
-            r = requests.post(
-                API_BACKEND,
-                headers={"Authorization": token},
-                json={"query": CHECK_QUERY, "variables": {"account": account}},
-                timeout=10,
-            )
-
-            log("📡", "HTTP", str(r.status_code), indent=3)
-
-            data   = r.json()
-            errors = data.get("errors")
-
-            if errors:
-                msg  = errors[0].get("message", str(errors))
-                code = errors[0].get("extensions", {}).get("errorCode", "")
-
-                if code == "KT-GB-9319":
-                    result("⏸ ", "No offers available right now — expected outside 5am window", indent=3)
-                    results[label] = {"unavailable": True}
-                elif code == "KT-GB-9316":
-                    result("❌", "Account is not enrolled in Octoplus", indent=3)
-                    results[label] = {"not_enrolled": True}
-                else:
-                    result(f"❌", f"API error — {msg} ({code})", indent=3)
-                    results[label] = {"api_error": True}
-                continue
-
-            groups = data.get("data", {}).get("octoplusOfferGroups", {})
-            edges  = groups.get("edges", []) if groups else []
-
-            if not edges:
-                result("⚠️ ", "No offer groups — account may not be on Octoplus", indent=3)
-                results[label] = {"no_offers": True}
-                continue
-
-            claimable_slug = None
-            for group in edges:
-                for offer in group["node"].get("octoplusOffers", []):
-                    slug      = offer.get("slug", "unknown")
-                    claimable = offer.get("claimAbility", {}).get("canClaimOffer", False)
-                    icon      = "✅ CLAIMABLE NOW" if claimable else "⏸  Not claimable (already claimed or vouchers gone)"
-                    log("🎟 ", slug, icon, indent=3)
-                    if claimable:
-                        claimable_slug = slug
-
-            results[label] = {"slug": claimable_slug, "token": token, "account": account}
-
-        except Exception as e:
-            result(f"❌", f"Request failed — {e}", indent=3)
-            results[label] = {"exception": True}
-
-    close_section()
-    return results
-
-# ─────────────────────────────────────────────
-#  PHASE 5 — CLAIM
-# ─────────────────────────────────────────────
-def attempt_claims(offer_results):
-    section("PHASE 5 — Claim Attempt")
-
-    claimable = {
-        label: info
-        for label, info in offer_results.items()
-        if info.get("slug")
-    }
-
-    if not claimable:
-        result("ℹ️ ", "No claimable offers found right now")
-        result("💡", "Expected if today's vouchers are gone — 5am run will catch them")
-        close_section()
-        return {}
-
-    claim_results = {}
-    lock          = threading.Lock()
-    all_done      = threading.Event()
-    counter       = [0]
-
-    def on_done():
-        with lock:
-            counter[0] += 1
-            if counter[0] >= len(claimable):
-                all_done.set()
-
-    def claim_worker(label, info):
-        token   = info["token"]
-        account = info["account"]
-        slug    = info["slug"]
-        print(f"  │")
-        print(f"  │  ▸ {label} — claiming {slug}")
-        try:
-            r = requests.post(
+            log.info("[%s] Claim attempt %d/%d for slug=%s", account.label, attempt, CLAIM_RETRIES, slug)
+            response = await client.post(
                 API_BACKEND,
                 headers={"Authorization": token},
                 json={
-                    "query": CLAIM_MUTATION,
-                    "variables": {"account": account, "slug": slug},
+                    "query": GQL_CLAIM,
+                    "variables": {
+                        "account": account.account_number,
+                        "slug": slug,
+                    },
                 },
-                timeout=10,
             )
-            resp    = r.json()
-            success = (
-                resp.get("data", {})
-                    .get("claimOctoplusReward", {})
-                    .get("success", False)
-            )
-            errors = resp.get("errors")
+            response.raise_for_status()
+            payload = response.json()
+            success = ((payload.get("data") or {}).get("claimOctoplusReward") or {}).get("success", False)
 
             if success:
-                result("✅", "Claimed successfully! 🎉", indent=3)
-                claim_results[label] = "claimed"
-            elif errors:
-                msg  = errors[0].get("message", str(errors))
-                code = errors[0].get("extensions", {}).get("errorCode", "")
-                result(f"❌", f"Claim rejected — {msg} ({code})", indent=3)
-                claim_results[label] = f"rejected: {msg}"
+                return True
+
+            errors = payload.get("errors") or []
+            if errors:
+                first = errors[0]
+                msg = first.get("message", str(payload))
+                code = (first.get("extensions") or {}).get("errorCode")
+                log.warning("[%s] Claim rejected: %s (%s)", account.label, msg, code)
             else:
-                result("⚠️ ", f"Unexpected response — {resp}", indent=3)
-                claim_results[label] = "unexpected"
+                log.warning("[%s] Claim unsuccessful: %s", account.label, payload)
 
-        except Exception as e:
-            result(f"❌", f"Claim request failed — {e}", indent=3)
-            claim_results[label] = f"exception: {e}"
-        finally:
-            on_done()
+        except httpx.HTTPStatusError as exc:
+            log.warning("[%s] Claim HTTP %s", account.label, exc.response.status_code)
+        except Exception as exc:
+            log.warning("[%s] Claim error: %s", account.label, exc)
 
-    threads = [
-        threading.Thread(target=claim_worker, args=(label, info))
-        for label, info in claimable.items()
-    ]
-    for t in threads:
-        t.start()
-    all_done.wait(timeout=POLL_WINDOW + 10)
-    for t in threads:
-        t.join(timeout=5)
+        if attempt < CLAIM_RETRIES:
+            await asyncio.sleep(1)
 
-    close_section()
-    return claim_results
+    return False
 
-# ─────────────────────────────────────────────
-#  SUMMARY
-# ─────────────────────────────────────────────
-def print_summary(offer_results, claim_results):
-    section("SUMMARY")
-    for acc in ACCOUNTS:
-        label = acc["label"]
-        info  = offer_results.get(label, {})
-        claim = (claim_results or {}).get(label)
 
-        if info.get("not_enrolled"):
-            status = "❌  Account not enrolled in Octoplus"
-        elif info.get("skip") or info.get("auth_failed"):
-            status = "❌  Auth error — check API key"
-        elif info.get("api_error") or info.get("exception"):
-            status = "❌  Unexpected error — check Phase 4 output"
-        elif info.get("no_offers") or info.get("unavailable"):
-            status = "⏸   Offers not available right now — run near 5am UK to claim"
-        elif info.get("slug"):
-            status = "✅  Claimed" if claim == "claimed" else f"⚠️   Offer found but claim failed ({claim})"
+async def inspect_account(account: Account, client: httpx.AsyncClient) -> TestResult:
+    log.info("[%s] Inspecting %s", account.label, account.masked)
+
+    if not account.is_valid:
+        log.error("[%s] Missing credentials", account.label)
+        return TestResult.MISSING_CREDS
+
+    token_mgr = TokenManager(account=account, client=client)
+    token = await token_mgr.get_valid_token()
+    if not token:
+        return TestResult.TOKEN_FAILED
+
+    outcome = await check_reward(client, token, account, verbose=True)
+
+    if outcome.state == CheckState.CLAIMABLE and outcome.slug:
+        log.info("[%s] Offer is claimable now: %s", account.label, outcome.slug)
+        claimed = await claim_reward(client, token, account, outcome.slug)
+        return TestResult.CLAIMED if claimed else TestResult.CLAIM_FAILED
+
+    if outcome.state == CheckState.ALREADY_CLAIMED:
+        return TestResult.ALREADY_CLAIMED
+
+    if outcome.state == CheckState.NOT_ENROLLED:
+        return TestResult.NOT_ENROLLED
+
+    if outcome.state == CheckState.NO_GROUPS:
+        return TestResult.NO_GROUPS
+
+    if outcome.state == CheckState.API_ERROR:
+        return TestResult.API_ERROR
+
+    return TestResult.NO_CLAIMABLE_OFFER
+
+
+def print_summary(accounts: list[Account], results: list[TestResult]) -> None:
+    width = 60
+    print("\n" + "═" * width)
+    print(f"{'TEST SUMMARY':^{width}}")
+    print("═" * width)
+    for account, result in zip(accounts, results):
+        print(f"{account.label:<14} {RESULT_LABEL[result]}")
+    print("═" * width + "\n")
+
+
+async def async_main() -> int:
+    print("════════════════════════════════════════════════════════════")
+    print("OCTOPUS COFFEE BOT · TEST")
+    print(datetime.now(UK_TZ).strftime("%A %d %b %Y %H:%M:%S %Z"))
+    print("Mode: FORCE_RUN")
+    print("════════════════════════════════════════════════════════════")
+
+    accounts = load_accounts()
+    if not accounts:
+        log.error("No accounts found. Set OCTO_APIKEY_1/OCTO_ACC_1 etc.")
+        return 1
+
+    log.info("Loaded %d account(s)", len(accounts))
+    log.info("Running immediate diagnostic test window (%ds)", TEST_WINDOW_SECONDS)
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5, read=10, write=10, pool=5),
+        http2=True,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    ) as client:
+        tasks = [asyncio.create_task(inspect_account(account, client)) for account in accounts]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results: list[TestResult] = []
+    for account, result in zip(accounts, raw_results):
+        if isinstance(result, BaseException):
+            log.error("[%s] Unhandled exception: %s", account.label, result, exc_info=result)
+            results.append(TestResult.API_ERROR)
         else:
-            status = "⏸   No claimable offer — vouchers gone or already claimed this week"
+            results.append(result)
 
-        log("", label, status, indent=1)
-    close_section()
+    print_summary(accounts, results)
+    return 0
 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
-def main():
-    header("OCTOPUS COFFEE BOT  ·  TEST RUN")
-    print(f"  Started : {datetime.now(UK_TZ).strftime('%A %d %b %Y  %H:%M:%S %Z')}")
-    print(f"  Mode    : {'⚡ FORCE_RUN (manual test)' if FORCE_RUN else '🕐 Scheduled run'}")
 
-    if not check_secrets():
-        sys.exit(1)
-
-    check_timezone()
-
-    if not check_api_connectivity():
-        sys.exit(1)
-
-    offer_results = check_offers()
-    claim_results = attempt_claims(offer_results)
-    print_summary(offer_results, claim_results)
-
-    header("TEST COMPLETE")
+def main() -> None:
+    sys.exit(asyncio.run(async_main()))
 
 
 if __name__ == "__main__":
