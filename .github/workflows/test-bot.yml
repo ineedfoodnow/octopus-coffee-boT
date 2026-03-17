@@ -6,7 +6,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -18,12 +18,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install httpx
 
       - name: Run test bot
         run: python test_bot.py
         env:
-          FORCE_RUN: "true"
           OCTO_APIKEY_1: ${{ secrets.OCTO_APIKEY_1 }}
           OCTO_ACC_1: ${{ secrets.OCTO_ACC_1 }}
           OCTO_APIKEY_2: ${{ secrets.OCTO_APIKEY_2 }}
