@@ -13,12 +13,12 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-API_BACKEND = "https://api.octopus.energy/v1/graphql/"
-UK_TZ = ZoneInfo("Europe/London")
+API_AUTH     = "https://api.octopus.energy/v1/graphql/"
+API_INTERNAL = "https://api.backend.octopus.energy/v1/graphql/"
+UK_TZ        = ZoneInfo("Europe/London")
 
-TEST_WINDOW_SECONDS = 120
-TOKEN_REFRESH_AFTER_SECONDS = 55 * 60
-CLAIM_RETRIES = 2
+CLAIM_RETRIES           = 2
+TOKEN_REFRESH_AFTER     = 55 * 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +55,7 @@ query Offers($account: String!) {
           slug
           claimAbility {
             canClaimOffer
+            cannotClaimReason
           }
         }
       }
@@ -66,45 +67,43 @@ query Offers($account: String!) {
 GQL_CLAIM = """
 mutation Claim($account: String!, $slug: String!) {
   claimOctoplusReward(accountNumber: $account, offerSlug: $slug) {
-    success
+    rewardId
   }
 }
 """
 
 
 class CheckState(Enum):
-    CLAIMABLE = auto()
-    WAIT = auto()
+    CLAIMABLE       = auto()
+    WAIT            = auto()
     ALREADY_CLAIMED = auto()
-    NOT_ENROLLED = auto()
-    NO_GROUPS = auto()
-    API_ERROR = auto()
+    NOT_ENROLLED    = auto()
+    NO_GROUPS       = auto()
+    API_ERROR       = auto()
 
 
 class TestResult(Enum):
-    CLAIMED = auto()
-    CLAIMABLE_FOUND = auto()
-    ALREADY_CLAIMED = auto()
-    NOT_ENROLLED = auto()
-    NO_GROUPS = auto()
-    NO_CLAIMABLE_OFFER = auto()
-    MISSING_CREDS = auto()
-    TOKEN_FAILED = auto()
-    CLAIM_FAILED = auto()
-    API_ERROR = auto()
+    CLAIMED             = auto()
+    ALREADY_CLAIMED     = auto()
+    NOT_ENROLLED        = auto()
+    NO_GROUPS           = auto()
+    NO_CLAIMABLE_OFFER  = auto()
+    MISSING_CREDS       = auto()
+    TOKEN_FAILED        = auto()
+    CLAIM_FAILED        = auto()
+    API_ERROR           = auto()
 
 
 RESULT_LABEL = {
-    TestResult.CLAIMED: "✅  Claimed successfully",
-    TestResult.CLAIMABLE_FOUND: "✅  Offer is claimable now",
-    TestResult.ALREADY_CLAIMED: "⏸   Already claimed this week",
-    TestResult.NOT_ENROLLED: "❌  Not enrolled in Octoplus",
-    TestResult.NO_GROUPS: "⚠️   No Octoplus offer groups returned",
-    TestResult.NO_CLAIMABLE_OFFER: "⏸   No claimable offer right now",
-    TestResult.MISSING_CREDS: "❌  Missing credentials",
-    TestResult.TOKEN_FAILED: "❌  Token exchange failed",
-    TestResult.CLAIM_FAILED: "❌  Claim failed after retries",
-    TestResult.API_ERROR: "❌  API error",
+    TestResult.CLAIMED:            "✅  Claimed successfully",
+    TestResult.ALREADY_CLAIMED:    "⏸   Already claimed this week",
+    TestResult.NOT_ENROLLED:       "❌  Not enrolled in Octoplus",
+    TestResult.NO_GROUPS:          "⚠️   No Octoplus offer groups returned",
+    TestResult.NO_CLAIMABLE_OFFER: "⏸   No claimable offer right now — expected outside 5am window",
+    TestResult.MISSING_CREDS:      "❌  Missing credentials",
+    TestResult.TOKEN_FAILED:       "❌  Token exchange failed",
+    TestResult.CLAIM_FAILED:       "❌  Claim failed after retries",
+    TestResult.API_ERROR:          "❌  API error",
 }
 
 
@@ -126,23 +125,22 @@ class Account:
 @dataclass
 class CheckOutcome:
     state: CheckState
-    slug: str | None = None
+    slug: str | None   = None
     reason: str | None = None
-    code: str | None = None
-    raw_offer_count: int = 0
+    code: str | None   = None
 
 
 @dataclass
 class TokenManager:
     account: Account
     client: httpx.AsyncClient
-    token: str | None = field(default=None, init=False)
-    refresh_token: str | None = field(default=None, init=False)
-    acquired_monotonic: float = field(default=0.0, init=False)
+    token: str | None          = field(default=None, init=False)
+    refresh_token: str | None  = field(default=None, init=False)
+    acquired_monotonic: float  = field(default=0.0,  init=False)
 
     async def get_valid_token(self) -> str | None:
         age = time.monotonic() - self.acquired_monotonic
-        if self.token and age < TOKEN_REFRESH_AFTER_SECONDS:
+        if self.token and age < TOKEN_REFRESH_AFTER:
             return self.token
         if self.refresh_token:
             token = await self._refresh()
@@ -151,46 +149,28 @@ class TokenManager:
         return await self._authenticate()
 
     async def _authenticate(self) -> str | None:
-        return await self._exchange(
-            query=GQL_OBTAIN_TOKEN,
-            variables={"apiKey": self.account.api_key},
-            auth=False,
-            action="API key auth",
-        )
+        return await self._exchange(GQL_OBTAIN_TOKEN, {"apiKey": self.account.api_key}, "API key auth")
 
     async def _refresh(self) -> str | None:
-        return await self._exchange(
-            query=GQL_REFRESH_TOKEN,
-            variables={"refreshToken": self.refresh_token},
-            auth=False,
-            action="token refresh",
-        )
+        return await self._exchange(GQL_REFRESH_TOKEN, {"refreshToken": self.refresh_token}, "token refresh")
 
-    async def _exchange(
-        self,
-        query: str,
-        variables: dict[str, Any],
-        auth: bool,
-        action: str,
-    ) -> str | None:
+    async def _exchange(self, query: str, variables: dict[str, Any], action: str) -> str | None:
         try:
-            headers = {"Authorization": self.token} if auth and self.token else {}
-            response = await self.client.post(
-                API_BACKEND,
-                headers=headers,
+            r = await self.client.post(
+                API_AUTH,
                 json={"query": query, "variables": variables},
             )
-            response.raise_for_status()
-            payload = response.json()
+            r.raise_for_status()
+            payload    = r.json()
             token_data = (payload.get("data") or {}).get("obtainKrakenToken") or {}
-            token = token_data.get("token")
+            token      = token_data.get("token")
             if token:
-                self.token = token
-                self.refresh_token = token_data.get("refreshToken")
+                self.token              = token
+                self.refresh_token      = token_data.get("refreshToken")
                 self.acquired_monotonic = time.monotonic()
                 log.info("[%s] Auth OK via %s", self.account.label, action)
                 return token
-            log.error("[%s] No token returned during %s: %s", self.account.label, action, payload.get("errors"))
+            log.error("[%s] No token during %s: %s", self.account.label, action, payload.get("errors"))
             return None
         except httpx.HTTPStatusError as exc:
             log.error("[%s] Auth HTTP %s during %s", self.account.label, exc.response.status_code, action)
@@ -214,6 +194,12 @@ def load_accounts() -> list[Account]:
 
 
 def interpret_reason(reason: str | None) -> CheckState | None:
+    if not reason:
+        return None
+    if reason == "MAX_CLAIMS_PER_PERIOD_REACHED":
+        return CheckState.ALREADY_CLAIMED
+    if reason == "OUT_OF_STOCK":
+        return None  # Keep polling — codes not dropped yet
     return None
 
 
@@ -221,22 +207,21 @@ async def check_reward(
     client: httpx.AsyncClient,
     token: str,
     account: Account,
-    verbose: bool = True,
 ) -> CheckOutcome:
     try:
-        response = await client.post(
-            API_BACKEND,
+        r = await client.post(
+            API_INTERNAL,
             headers={"Authorization": token},
             json={"query": GQL_CHECK, "variables": {"account": account.account_number}},
         )
-        response.raise_for_status()
-        payload = response.json()
-        errors = payload.get("errors") or []
+        r.raise_for_status()
+        payload = r.json()
+        errors  = payload.get("errors") or []
 
         if errors:
             first = errors[0]
-            code = (first.get("extensions") or {}).get("errorCode")
-            msg = first.get("message", "")
+            code  = (first.get("extensions") or {}).get("errorCode")
+            msg   = first.get("message", "")
 
             if code == "KT-GB-9319":
                 log.info("[%s] Offers not available yet (%s)", account.label, code)
@@ -250,7 +235,7 @@ async def check_reward(
             return CheckOutcome(state=CheckState.API_ERROR, code=code, reason=msg)
 
         groups = (payload.get("data") or {}).get("octoplusOfferGroups") or {}
-        edges = groups.get("edges") or []
+        edges  = groups.get("edges") or []
 
         log.info("[%s] %d offer group(s) returned", account.label, len(edges))
 
@@ -258,43 +243,25 @@ async def check_reward(
             log.warning("[%s] No offer groups returned", account.label)
             return CheckOutcome(state=CheckState.NO_GROUPS)
 
-        offers_seen = 0
         for group in edges:
             for offer in group.get("node", {}).get("octoplusOffers") or []:
-                offers_seen += 1
-                slug = offer.get("slug", "unknown")
-                claim_ability = offer.get("claimAbility") or {}
-                can_claim = bool(claim_ability.get("canClaimOffer"))
-                reason = claim_ability.get("reasonCantClaim")
+                slug      = offer.get("slug", "unknown")
+                ability   = offer.get("claimAbility") or {}
+                can_claim = bool(ability.get("canClaimOffer"))
+                reason    = ability.get("cannotClaimReason")
 
                 if can_claim:
-                    log.info("[%s] slug=%s  ✅ CLAIMABLE", account.label, slug)
-                    return CheckOutcome(
-                        state=CheckState.CLAIMABLE,
-                        slug=slug,
-                        reason=reason,
-                        raw_offer_count=offers_seen,
-                    )
+                    log.info("[%s] slug=%-40s ✅ CLAIMABLE", account.label, slug)
+                    return CheckOutcome(state=CheckState.CLAIMABLE, slug=slug)
 
-                log.info("[%s] slug=%s  ⏸ %s", account.label, slug, reason or "not claimable")
+                log.info("[%s] slug=%-40s ⏸  %s", account.label, slug, reason or "not claimable")
 
                 inferred = interpret_reason(reason)
                 if inferred == CheckState.ALREADY_CLAIMED:
-                    return CheckOutcome(
-                        state=CheckState.ALREADY_CLAIMED,
-                        slug=slug,
-                        reason=reason,
-                        raw_offer_count=offers_seen,
-                    )
-                if inferred == CheckState.NOT_ENROLLED:
-                    return CheckOutcome(
-                        state=CheckState.NOT_ENROLLED,
-                        slug=slug,
-                        reason=reason,
-                        raw_offer_count=offers_seen,
-                    )
+                    log.info("[%s] Already claimed this week (%s)", account.label, reason)
+                    return CheckOutcome(state=CheckState.ALREADY_CLAIMED, reason=reason)
 
-        return CheckOutcome(state=CheckState.WAIT, raw_offer_count=offers_seen)
+        return CheckOutcome(state=CheckState.WAIT)
 
     except httpx.HTTPStatusError as exc:
         log.warning("[%s] Check HTTP %s", account.label, exc.response.status_code)
@@ -312,33 +279,30 @@ async def claim_reward(
 ) -> bool:
     for attempt in range(1, CLAIM_RETRIES + 1):
         try:
-            log.info("[%s] Claim attempt %d/%d for slug=%s", account.label, attempt, CLAIM_RETRIES, slug)
-            response = await client.post(
-                API_BACKEND,
+            log.info("[%s] Claim attempt %d/%d slug=%s", account.label, attempt, CLAIM_RETRIES, slug)
+            r = await client.post(
+                API_INTERNAL,
                 headers={"Authorization": token},
                 json={
                     "query": GQL_CLAIM,
-                    "variables": {
-                        "account": account.account_number,
-                        "slug": slug,
-                    },
+                    "variables": {"account": account.account_number, "slug": slug},
                 },
             )
-            response.raise_for_status()
-            payload = response.json()
-            success = ((payload.get("data") or {}).get("claimOctoplusReward") or {}).get("success", False)
+            r.raise_for_status()
+            payload   = r.json()
+            reward_id = ((payload.get("data") or {}).get("claimOctoplusReward") or {}).get("rewardId")
 
-            if success:
+            if reward_id:
+                log.info("[%s] Claimed! Reward ID: %s", account.label, reward_id)
                 return True
 
             errors = payload.get("errors") or []
             if errors:
-                first = errors[0]
-                msg = first.get("message", str(payload))
-                code = (first.get("extensions") or {}).get("errorCode")
+                msg  = errors[0].get("message", str(payload))
+                code = (errors[0].get("extensions") or {}).get("errorCode")
                 log.warning("[%s] Claim rejected: %s (%s)", account.label, msg, code)
             else:
-                log.warning("[%s] Claim unsuccessful: %s", account.label, payload)
+                log.warning("[%s] No rewardId in response: %s", account.label, payload)
 
         except httpx.HTTPStatusError as exc:
             log.warning("[%s] Claim HTTP %s", account.label, exc.response.status_code)
@@ -358,15 +322,14 @@ async def inspect_account(account: Account, client: httpx.AsyncClient) -> TestRe
         log.error("[%s] Missing credentials", account.label)
         return TestResult.MISSING_CREDS
 
-    token_mgr = TokenManager(account=account, client=client)
-    token = await token_mgr.get_valid_token()
+    tm    = TokenManager(account=account, client=client)
+    token = await tm.get_valid_token()
     if not token:
         return TestResult.TOKEN_FAILED
 
-    outcome = await check_reward(client, token, account, verbose=True)
+    outcome = await check_reward(client, token, account)
 
     if outcome.state == CheckState.CLAIMABLE and outcome.slug:
-        log.info("[%s] Offer is claimable now: %s", account.label, outcome.slug)
         claimed = await claim_reward(client, token, account, outcome.slug)
         return TestResult.CLAIMED if claimed else TestResult.CLAIM_FAILED
 
@@ -386,44 +349,42 @@ async def inspect_account(account: Account, client: httpx.AsyncClient) -> TestRe
 
 
 def print_summary(accounts: list[Account], results: list[TestResult]) -> None:
-    width = 60
-    print("\n" + "═" * width)
-    print(f"{'TEST SUMMARY':^{width}}")
-    print("═" * width)
+    w = 60
+    print("\n" + "═" * w)
+    print(f"{'TEST SUMMARY':^{w}}")
+    print("═" * w)
     for account, result in zip(accounts, results):
-        print(f"{account.label:<14} {RESULT_LABEL[result]}")
-    print("═" * width + "\n")
+        print(f"  {account.label:<14} {RESULT_LABEL[result]}")
+    print("═" * w + "\n")
 
 
 async def async_main() -> int:
     print("════════════════════════════════════════════════════════════")
-    print("OCTOPUS COFFEE BOT · TEST")
-    print(datetime.now(UK_TZ).strftime("%A %d %b %Y %H:%M:%S %Z"))
-    print("Mode: FORCE_RUN")
+    print("  OCTOPUS COFFEE BOT · TEST")
+    print(f"  {datetime.now(UK_TZ).strftime('%A %d %b %Y %H:%M:%S %Z')}")
     print("════════════════════════════════════════════════════════════")
 
     accounts = load_accounts()
     if not accounts:
-        log.error("No accounts found. Set OCTO_APIKEY_1/OCTO_ACC_1 etc.")
+        log.error("No accounts found — set OCTO_APIKEY_1/OCTO_ACC_1 etc.")
         return 1
 
     log.info("Loaded %d account(s)", len(accounts))
-    log.info("Running immediate diagnostic test window (%ds)", TEST_WINDOW_SECONDS)
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=10, write=10, pool=5),
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     ) as client:
-        tasks = [asyncio.create_task(inspect_account(account, client)) for account in accounts]
+        tasks       = [asyncio.create_task(inspect_account(acc, client)) for acc in accounts]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list[TestResult] = []
-    for account, result in zip(accounts, raw_results):
-        if isinstance(result, BaseException):
-            log.error("[%s] Unhandled exception: %s", account.label, result, exc_info=result)
+    for acc, res in zip(accounts, raw_results):
+        if isinstance(res, BaseException):
+            log.error("[%s] Unhandled exception: %s", acc.label, res, exc_info=res)
             results.append(TestResult.API_ERROR)
         else:
-            results.append(result)
+            results.append(res)
 
     print_summary(accounts, results)
     return 0
