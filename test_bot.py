@@ -17,8 +17,15 @@ API_AUTH     = "https://api.octopus.energy/v1/graphql/"
 API_INTERNAL = "https://api.backend.octopus.energy/v1/graphql/"
 UK_TZ        = ZoneInfo("Europe/London")
 
-CLAIM_RETRIES           = 2
-TOKEN_REFRESH_AFTER     = 55 * 60
+CLAIM_RETRIES         = 2
+TOKEN_REFRESH_AFTER   = 55 * 60
+
+# Only claim Caffe Nero offers — everything else is skipped
+NERO_KEYWORDS = {"caffe-nero", "caffenero", "nero"}
+
+def is_nero_offer(slug: str) -> bool:
+    slug_lower = slug.lower()
+    return any(keyword in slug_lower for keyword in NERO_KEYWORDS)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,27 +90,27 @@ class CheckState(Enum):
 
 
 class TestResult(Enum):
-    CLAIMED             = auto()
-    ALREADY_CLAIMED     = auto()
-    NOT_ENROLLED        = auto()
-    NO_GROUPS           = auto()
-    NO_CLAIMABLE_OFFER  = auto()
-    MISSING_CREDS       = auto()
-    TOKEN_FAILED        = auto()
-    CLAIM_FAILED        = auto()
-    API_ERROR           = auto()
+    CLAIMED            = auto()
+    ALREADY_CLAIMED    = auto()
+    NOT_ENROLLED       = auto()
+    NO_GROUPS          = auto()
+    NO_NERO_OFFER      = auto()
+    MISSING_CREDS      = auto()
+    TOKEN_FAILED       = auto()
+    CLAIM_FAILED       = auto()
+    API_ERROR          = auto()
 
 
 RESULT_LABEL = {
-    TestResult.CLAIMED:            "✅  Claimed successfully",
-    TestResult.ALREADY_CLAIMED:    "⏸   Already claimed this week",
-    TestResult.NOT_ENROLLED:       "❌  Not enrolled in Octoplus",
-    TestResult.NO_GROUPS:          "⚠️   No Octoplus offer groups returned",
-    TestResult.NO_CLAIMABLE_OFFER: "⏸   No claimable offer right now — expected outside 5am window",
-    TestResult.MISSING_CREDS:      "❌  Missing credentials",
-    TestResult.TOKEN_FAILED:       "❌  Token exchange failed",
-    TestResult.CLAIM_FAILED:       "❌  Claim failed after retries",
-    TestResult.API_ERROR:          "❌  API error",
+    TestResult.CLAIMED:         "✅  Caffe Nero claimed successfully",
+    TestResult.ALREADY_CLAIMED: "⏸   Already claimed this week",
+    TestResult.NOT_ENROLLED:    "❌  Not enrolled in Octoplus",
+    TestResult.NO_GROUPS:       "⚠️   No Octoplus offer groups returned",
+    TestResult.NO_NERO_OFFER:   "⏸   No Nero offer claimable right now — expected outside 5am window",
+    TestResult.MISSING_CREDS:   "❌  Missing credentials",
+    TestResult.TOKEN_FAILED:    "❌  Token exchange failed",
+    TestResult.CLAIM_FAILED:    "❌  Claim failed after retries",
+    TestResult.API_ERROR:       "❌  API error",
 }
 
 
@@ -134,9 +141,9 @@ class CheckOutcome:
 class TokenManager:
     account: Account
     client: httpx.AsyncClient
-    token: str | None          = field(default=None, init=False)
-    refresh_token: str | None  = field(default=None, init=False)
-    acquired_monotonic: float  = field(default=0.0,  init=False)
+    token: str | None         = field(default=None, init=False)
+    refresh_token: str | None = field(default=None, init=False)
+    acquired_monotonic: float = field(default=0.0,  init=False)
 
     async def get_valid_token(self) -> str | None:
         age = time.monotonic() - self.acquired_monotonic
@@ -199,7 +206,7 @@ def interpret_reason(reason: str | None) -> CheckState | None:
     if reason == "MAX_CLAIMS_PER_PERIOD_REACHED":
         return CheckState.ALREADY_CLAIMED
     if reason == "OUT_OF_STOCK":
-        return None  # Keep polling — codes not dropped yet
+        return None
     return None
 
 
@@ -249,6 +256,10 @@ async def check_reward(
                 ability   = offer.get("claimAbility") or {}
                 can_claim = bool(ability.get("canClaimOffer"))
                 reason    = ability.get("cannotClaimReason")
+
+                if not is_nero_offer(slug):
+                    log.info("[%s] slug=%-40s ⏭  Skipping — not a Nero offer", account.label, slug)
+                    continue
 
                 if can_claim:
                     log.info("[%s] slug=%-40s ✅ CLAIMABLE", account.label, slug)
@@ -345,7 +356,7 @@ async def inspect_account(account: Account, client: httpx.AsyncClient) -> TestRe
     if outcome.state == CheckState.API_ERROR:
         return TestResult.API_ERROR
 
-    return TestResult.NO_CLAIMABLE_OFFER
+    return TestResult.NO_NERO_OFFER
 
 
 def print_summary(accounts: list[Account], results: list[TestResult]) -> None:
