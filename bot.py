@@ -13,22 +13,28 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-# Auth uses the public endpoint; check/claim use the internal app endpoint
 API_AUTH     = "https://api.octopus.energy/v1/graphql/"
 API_INTERNAL = "https://api.backend.octopus.energy/v1/graphql/"
 UK_TZ        = ZoneInfo("Europe/London")
 
 FORCE_RUN = os.environ.get("FORCE_RUN", "false").lower() == "true"
 
-TARGET_HOUR             = 5
-TARGET_MINUTE           = 2
-TARGET_BUFFER_SECONDS   = 10
-POLL_WINDOW_SECONDS     = 20 * 60
-MAX_PRE_SLEEP_SECONDS   = 10 * 60
-BASE_POLL_INTERVAL      = 0.5
-SURGE_WINDOW_SECONDS    = 30
-CLAIM_RETRIES           = 3
-TOKEN_REFRESH_AFTER     = 55 * 60
+TARGET_HOUR           = 5
+TARGET_MINUTE         = 2
+TARGET_BUFFER_SECONDS = 10
+POLL_WINDOW_SECONDS   = 20 * 60
+MAX_PRE_SLEEP_SECONDS = 10 * 60
+BASE_POLL_INTERVAL    = 0.5
+SURGE_WINDOW_SECONDS  = 30
+CLAIM_RETRIES         = 3
+TOKEN_REFRESH_AFTER   = 55 * 60
+
+# Only claim Caffe Nero offers — everything else is skipped
+NERO_KEYWORDS = {"caffe-nero", "caffenero", "nero"}
+
+def is_nero_offer(slug: str) -> bool:
+    slug_lower = slug.lower()
+    return any(keyword in slug_lower for keyword in NERO_KEYWORDS)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,32 +90,32 @@ mutation Claim($account: String!, $slug: String!) {
 
 
 class CheckState(Enum):
-    CLAIMABLE      = auto()
-    WAIT           = auto()
+    CLAIMABLE       = auto()
+    WAIT            = auto()
     ALREADY_CLAIMED = auto()
-    NOT_ENROLLED   = auto()
-    NO_GROUPS      = auto()
-    API_ERROR      = auto()
+    NOT_ENROLLED    = auto()
+    NO_GROUPS       = auto()
+    API_ERROR       = auto()
 
 
 class WorkerResult(Enum):
-    CLAIMED        = auto()
+    CLAIMED         = auto()
     ALREADY_CLAIMED = auto()
-    NOT_ENROLLED   = auto()
-    NO_GROUPS      = auto()
-    WINDOW_EXPIRED = auto()
-    MISSING_CREDS  = auto()
-    TOKEN_FAILED   = auto()
-    CLAIM_FAILED   = auto()
-    API_ERROR      = auto()
+    NOT_ENROLLED    = auto()
+    NO_GROUPS       = auto()
+    WINDOW_EXPIRED  = auto()
+    MISSING_CREDS   = auto()
+    TOKEN_FAILED    = auto()
+    CLAIM_FAILED    = auto()
+    API_ERROR       = auto()
 
 
 RESULT_LABEL = {
-    WorkerResult.CLAIMED:         "✅  Claimed successfully",
+    WorkerResult.CLAIMED:         "✅  Claimed Caffe Nero successfully",
     WorkerResult.ALREADY_CLAIMED: "⏸   Already claimed this week",
     WorkerResult.NOT_ENROLLED:    "❌  Not enrolled in Octoplus",
     WorkerResult.NO_GROUPS:       "⚠️   No Octoplus offer groups returned",
-    WorkerResult.WINDOW_EXPIRED:  "⏸   Window expired — no claimable offer found",
+    WorkerResult.WINDOW_EXPIRED:  "⏸   Window expired — no Nero offer found",
     WorkerResult.MISSING_CREDS:   "❌  Missing credentials",
     WorkerResult.TOKEN_FAILED:    "❌  Token exchange failed",
     WorkerResult.CLAIM_FAILED:    "❌  Claim failed after retries",
@@ -135,18 +141,18 @@ class Account:
 @dataclass
 class CheckOutcome:
     state: CheckState
-    slug: str | None  = None
+    slug: str | None   = None
     reason: str | None = None
-    code: str | None  = None
+    code: str | None   = None
 
 
 @dataclass
 class TokenManager:
     account: Account
     client: httpx.AsyncClient
-    token: str | None              = field(default=None, init=False)
-    refresh_token: str | None      = field(default=None, init=False)
-    acquired_monotonic: float      = field(default=0.0,  init=False)
+    token: str | None         = field(default=None, init=False)
+    refresh_token: str | None = field(default=None, init=False)
+    acquired_monotonic: float = field(default=0.0,  init=False)
 
     async def get_valid_token(self) -> str | None:
         age = time.monotonic() - self.acquired_monotonic
@@ -175,8 +181,8 @@ class TokenManager:
             token_data = (payload.get("data") or {}).get("obtainKrakenToken") or {}
             token      = token_data.get("token")
             if token:
-                self.token             = token
-                self.refresh_token     = token_data.get("refreshToken")
+                self.token              = token
+                self.refresh_token      = token_data.get("refreshToken")
                 self.acquired_monotonic = time.monotonic()
                 log.info("[%s] Auth OK via %s", self.account.label, action)
                 return token
@@ -272,6 +278,11 @@ async def check_reward(
                 can_claim = bool(ability.get("canClaimOffer"))
                 reason    = ability.get("cannotClaimReason")
 
+                if not is_nero_offer(slug):
+                    if verbose:
+                        log.info("[%s] slug=%-40s ⏭  Skipping — not a Nero offer", account.label, slug)
+                    continue
+
                 if verbose:
                     if can_claim:
                         log.info("[%s] slug=%-40s ✅ CLAIMABLE", account.label, slug)
@@ -354,7 +365,7 @@ async def worker(account: Account, client: httpx.AsyncClient, end_ts: float) -> 
     if not token:
         return WorkerResult.TOKEN_FAILED
 
-    polls          = 0
+    polls           = 0
     start_monotonic = time.monotonic()
 
     while time.time() < end_ts:
@@ -368,7 +379,7 @@ async def worker(account: Account, client: httpx.AsyncClient, end_ts: float) -> 
 
         if outcome.state == CheckState.CLAIMABLE and outcome.slug:
             elapsed = time.monotonic() - start_monotonic
-            log.info("[%s] 🎟  Offer found after %d polls (%.1fs): %s",
+            log.info("[%s] 🎟  Nero offer found after %d polls (%.1fs): %s",
                      account.label, polls, elapsed, outcome.slug)
 
             token = await tm.get_valid_token()
@@ -392,7 +403,7 @@ async def worker(account: Account, client: httpx.AsyncClient, end_ts: float) -> 
 
         await asyncio.sleep(adaptive_interval(end_ts))
 
-    log.info("[%s] Window closed after %d polls — no offer found", account.label, polls)
+    log.info("[%s] Window closed after %d polls", account.label, polls)
     return WorkerResult.WINDOW_EXPIRED
 
 
@@ -404,7 +415,7 @@ def build_times() -> tuple[float, float]:
 
 
 async def wait_for_target() -> tuple[bool, float]:
-    now              = datetime.now(UK_TZ)
+    now               = datetime.now(UK_TZ)
     target_ts, end_ts = build_times()
 
     log.info("Current UK time: %s", now.strftime("%A %d %b %Y %H:%M:%S %Z"))
