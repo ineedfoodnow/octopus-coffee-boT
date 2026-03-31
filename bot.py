@@ -13,13 +13,14 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+# Auth uses the public endpoint; check/claim use the internal app endpoint
 API_AUTH     = "https://api.octopus.energy/v1/graphql/"
 API_INTERNAL = "https://api.backend.octopus.energy/v1/graphql/"
 UK_TZ        = ZoneInfo("Europe/London")
 
 FORCE_RUN = os.environ.get("FORCE_RUN", "false").lower() == "true"
 
-TARGET_HOUR           = 5
+TARGET_HOUR           = 6       # 6am BST (summer) — Octopus drops codes at 5am UTC
 TARGET_MINUTE         = 2
 TARGET_BUFFER_SECONDS = 10
 POLL_WINDOW_SECONDS   = 20 * 60
@@ -36,13 +37,19 @@ def is_nero_offer(slug: str) -> bool:
     slug_lower = slug.lower()
     return any(keyword in slug_lower for keyword in NERO_KEYWORDS)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
-)
+
+# ── Logging — always show UK/BST time regardless of runner timezone ──────────
+class UKFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=UK_TZ)
+        return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(UKFormatter(fmt="%(asctime)s  %(levelname)-8s  %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger("octopus-bot")
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 GQL_OBTAIN_TOKEN = """
 mutation ObtainToken($apiKey: String!) {
@@ -410,7 +417,8 @@ async def worker(account: Account, client: httpx.AsyncClient, end_ts: float) -> 
 def build_times() -> tuple[float, float]:
     now    = datetime.now(UK_TZ)
     target = now.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
-    end    = now.replace(hour=5,           minute=0,             second=0, microsecond=0).timestamp() + POLL_WINDOW_SECONDS
+    # Cutoff = TARGET_HOUR:00 + POLL_WINDOW_SECONDS (uses TARGET_HOUR, not hardcoded 5)
+    end    = now.replace(hour=TARGET_HOUR, minute=0, second=0, microsecond=0).timestamp() + POLL_WINDOW_SECONDS
     return target.timestamp(), end
 
 
@@ -418,10 +426,11 @@ async def wait_for_target() -> tuple[bool, float]:
     now               = datetime.now(UK_TZ)
     target_ts, end_ts = build_times()
 
-    log.info("Current UK time: %s", now.strftime("%A %d %b %Y %H:%M:%S %Z"))
-    log.info("Target: %02d:%02d UK  |  Cutoff: %s",
+    log.info("Current UK time : %s", now.strftime("%A %d %b %Y %H:%M:%S %Z"))
+    log.info("Target          : %02d:%02d %s  |  Cutoff: %s",
              TARGET_HOUR, TARGET_MINUTE,
-             datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S"))
+             now.strftime("%Z"),
+             datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S %Z"))
 
     if FORCE_RUN:
         log.info("FORCE_RUN — bypassing time guard, 2-minute window")
@@ -473,6 +482,7 @@ async def async_main() -> int:
     print("  OCTOPUS COFFEE BOT · PRODUCTION")
     print(f"  {datetime.now(UK_TZ).strftime('%A %d %b %Y %H:%M:%S %Z')}")
     print(f"  Mode: {'⚡ FORCE_RUN' if FORCE_RUN else '🕐 Scheduled'}")
+    print(f"  Target: {TARGET_HOUR:02d}:{TARGET_MINUTE:02d} UK time")
     print("════════════════════════════════════════════════════════════")
 
     accounts = load_accounts()
