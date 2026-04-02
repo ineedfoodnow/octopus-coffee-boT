@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -13,32 +12,23 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-# Auth uses the public endpoint; check/claim use the internal app endpoint
 API_AUTH     = "https://api.octopus.energy/v1/graphql/"
 API_INTERNAL = "https://api.backend.octopus.energy/v1/graphql/"
 UK_TZ        = ZoneInfo("Europe/London")
 
-FORCE_RUN = os.environ.get("FORCE_RUN", "false").lower() == "true"
+# Bot runs for up to this long from launch — cron job controls WHEN it runs
+POLL_WINDOW_SECONDS  = 30 * 60   # 30-minute safety-net max runtime
+BASE_POLL_INTERVAL   = 0.5
+CLAIM_RETRIES        = 3
+TOKEN_REFRESH_AFTER  = 55 * 60
 
-TARGET_HOUR           = 6       # 6am BST (summer) — Octopus drops codes at 5am UTC
-TARGET_MINUTE         = 2
-TARGET_BUFFER_SECONDS = 10
-POLL_WINDOW_SECONDS   = 20 * 60
-MAX_PRE_SLEEP_SECONDS = 10 * 60
-BASE_POLL_INTERVAL    = 0.5
-SURGE_WINDOW_SECONDS  = 30
-CLAIM_RETRIES         = 3
-TOKEN_REFRESH_AFTER   = 55 * 60
-
-# Only claim Caffe Nero offers — everything else is skipped
 NERO_KEYWORDS = {"caffe-nero", "caffenero", "nero"}
 
 def is_nero_offer(slug: str) -> bool:
-    slug_lower = slug.lower()
-    return any(keyword in slug_lower for keyword in NERO_KEYWORDS)
+    return any(keyword in slug.lower() for keyword in NERO_KEYWORDS)
 
 
-# ── Logging — always show UK/BST time regardless of runner timezone ──────────
+# ── Logging — always show UK/BST time ────────────────────────────────────────
 class UKFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=UK_TZ)
@@ -100,6 +90,7 @@ class CheckState(Enum):
     CLAIMABLE       = auto()
     WAIT            = auto()
     ALREADY_CLAIMED = auto()
+    OUT_OF_STOCK    = auto()   # Codes genuinely exhausted — stop polling
     NOT_ENROLLED    = auto()
     NO_GROUPS       = auto()
     API_ERROR       = auto()
@@ -108,6 +99,7 @@ class CheckState(Enum):
 class WorkerResult(Enum):
     CLAIMED         = auto()
     ALREADY_CLAIMED = auto()
+    OUT_OF_STOCK    = auto()
     NOT_ENROLLED    = auto()
     NO_GROUPS       = auto()
     WINDOW_EXPIRED  = auto()
@@ -120,9 +112,10 @@ class WorkerResult(Enum):
 RESULT_LABEL = {
     WorkerResult.CLAIMED:         "✅  Claimed Caffe Nero successfully",
     WorkerResult.ALREADY_CLAIMED: "⏸   Already claimed this week",
+    WorkerResult.OUT_OF_STOCK:    "🚫  Out of stock — codes exhausted",
     WorkerResult.NOT_ENROLLED:    "❌  Not enrolled in Octoplus",
     WorkerResult.NO_GROUPS:       "⚠️   No Octoplus offer groups returned",
-    WorkerResult.WINDOW_EXPIRED:  "⏸   Window expired — no Nero offer found",
+    WorkerResult.WINDOW_EXPIRED:  "⏸   Max runtime reached — no Nero offer found",
     WorkerResult.MISSING_CREDS:   "❌  Missing credentials",
     WorkerResult.TOKEN_FAILED:    "❌  Token exchange failed",
     WorkerResult.CLAIM_FAILED:    "❌  Claim failed after retries",
@@ -216,22 +209,14 @@ def load_accounts() -> list[Account]:
     return accounts
 
 
-def adaptive_interval(end_ts: float) -> float:
-    remaining = end_ts - time.time()
-    if remaining <= 0:
-        return 0.1
-    if remaining >= SURGE_WINDOW_SECONDS:
-        return BASE_POLL_INTERVAL
-    return 0.1 + (BASE_POLL_INTERVAL - 0.1) * (remaining / SURGE_WINDOW_SECONDS)
-
-
 def interpret_reason(reason: str | None) -> CheckState | None:
     if not reason:
         return None
     if reason == "MAX_CLAIMS_PER_PERIOD_REACHED":
         return CheckState.ALREADY_CLAIMED
     if reason == "OUT_OF_STOCK":
-        return None  # Keep polling — codes not dropped yet
+        # Codes genuinely exhausted for this week — no point polling further
+        return CheckState.OUT_OF_STOCK
     return None
 
 
@@ -303,6 +288,9 @@ async def check_reward(
                 if inferred == CheckState.ALREADY_CLAIMED:
                     log.info("[%s] Already claimed this week (%s)", account.label, reason)
                     return CheckOutcome(state=CheckState.ALREADY_CLAIMED, reason=reason)
+                if inferred == CheckState.OUT_OF_STOCK:
+                    log.info("[%s] Nero offer is out of stock (%s) — stopping", account.label, reason)
+                    return CheckOutcome(state=CheckState.OUT_OF_STOCK, reason=reason)
 
         return CheckOutcome(state=CheckState.WAIT)
 
@@ -402,58 +390,19 @@ async def worker(account: Account, client: httpx.AsyncClient, end_ts: float) -> 
         if outcome.state == CheckState.ALREADY_CLAIMED:
             return WorkerResult.ALREADY_CLAIMED
 
+        if outcome.state == CheckState.OUT_OF_STOCK:
+            return WorkerResult.OUT_OF_STOCK
+
         if outcome.state == CheckState.NOT_ENROLLED:
             return WorkerResult.NOT_ENROLLED
 
         if outcome.state == CheckState.NO_GROUPS:
             return WorkerResult.NO_GROUPS
 
-        await asyncio.sleep(adaptive_interval(end_ts))
+        await asyncio.sleep(BASE_POLL_INTERVAL)
 
-    log.info("[%s] Window closed after %d polls", account.label, polls)
+    log.info("[%s] Max runtime reached after %d polls", account.label, polls)
     return WorkerResult.WINDOW_EXPIRED
-
-
-def build_times() -> tuple[float, float]:
-    now    = datetime.now(UK_TZ)
-    target = now.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
-    # Cutoff = TARGET_HOUR:00 + POLL_WINDOW_SECONDS (uses TARGET_HOUR, not hardcoded 5)
-    end    = now.replace(hour=TARGET_HOUR, minute=0, second=0, microsecond=0).timestamp() + POLL_WINDOW_SECONDS
-    return target.timestamp(), end
-
-
-async def wait_for_target() -> tuple[bool, float]:
-    now               = datetime.now(UK_TZ)
-    target_ts, end_ts = build_times()
-
-    log.info("Current UK time : %s", now.strftime("%A %d %b %Y %H:%M:%S %Z"))
-    log.info("Target          : %02d:%02d %s  |  Cutoff: %s",
-             TARGET_HOUR, TARGET_MINUTE,
-             now.strftime("%Z"),
-             datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S %Z"))
-
-    if FORCE_RUN:
-        log.info("FORCE_RUN — bypassing time guard, 2-minute window")
-        return True, time.time() + 120
-
-    if end_ts - time.time() <= 0:
-        log.info("Past hard cutoff — stale trigger, exiting")
-        return False, 0
-
-    secs_to_target = target_ts - time.time()
-    if secs_to_target > MAX_PRE_SLEEP_SECONDS:
-        log.info("Trigger too early (%.0fs before target) — exiting", secs_to_target)
-        return False, 0
-
-    wake_ts = target_ts - TARGET_BUFFER_SECONDS
-    sleep_s = wake_ts - time.time()
-    if sleep_s > 0:
-        log.info("Sleeping %.1fs — waking %ds before target", sleep_s, TARGET_BUFFER_SECONDS)
-        await asyncio.sleep(sleep_s)
-    else:
-        log.info("Already inside polling window — starting immediately")
-
-    return True, end_ts
 
 
 def print_summary(accounts: list[Account], results: list[WorkerResult]) -> None:
@@ -478,11 +427,11 @@ def resolve_exit_code(results: list[WorkerResult]) -> int:
 
 
 async def async_main() -> int:
+    now = datetime.now(UK_TZ)
     print("════════════════════════════════════════════════════════════")
     print("  OCTOPUS COFFEE BOT · PRODUCTION")
-    print(f"  {datetime.now(UK_TZ).strftime('%A %d %b %Y %H:%M:%S %Z')}")
-    print(f"  Mode: {'⚡ FORCE_RUN' if FORCE_RUN else '🕐 Scheduled'}")
-    print(f"  Target: {TARGET_HOUR:02d}:{TARGET_MINUTE:02d} UK time")
+    print(f"  {now.strftime('%A %d %b %Y %H:%M:%S %Z')}")
+    print(f"  Max runtime: {POLL_WINDOW_SECONDS // 60} minutes")
     print("════════════════════════════════════════════════════════════")
 
     accounts = load_accounts()
@@ -492,11 +441,9 @@ async def async_main() -> int:
 
     log.info("Loaded %d account(s)", len(accounts))
 
-    should_run, end_ts = await wait_for_target()
-    if not should_run:
-        return 0
-
-    log.info("Polling open until %s",
+    # No time-of-day check — start polling immediately
+    end_ts = time.time() + POLL_WINDOW_SECONDS
+    log.info("Polling until %s",
              datetime.fromtimestamp(end_ts, tz=UK_TZ).strftime("%H:%M:%S %Z"))
 
     async with httpx.AsyncClient(
